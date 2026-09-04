@@ -18,6 +18,23 @@ from trpc_agent_sdk.log import logger
 from ._tenant_model import Tenant, TenantConfig
 
 
+class OptimisticLockError(Exception):
+    """Raised when a concurrent writer modified the row first.
+
+    The SQL tenant store guards ``update_tenant`` with the row's ``version``
+    column: the update only applies when the version read by the caller is
+    still current. On conflict the caller should re-read the tenant and retry
+    (last-writer-wins with detection, not silent overwrite).
+    """
+
+
+def _tenant_with_version(tenant: Tenant, version: int) -> Tenant:
+    """Return a shallow copy of ``tenant`` with a specific lock version."""
+    import dataclasses
+
+    return dataclasses.replace(tenant, version=version)
+
+
 class TenantStore(ABC):
     """Abstract base class for tenant storage backends."""
 
@@ -326,7 +343,7 @@ class SqlTenantStore(TenantStore):
             database_url: Database connection URL
         """
         try:
-            from sqlalchemy import (Column, String, Text, Boolean, DateTime, create_engine)  # noqa: F401
+            from sqlalchemy import (Column, Integer, String, Text, Boolean, DateTime, create_engine)  # noqa: F401
             from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession  # noqa: F401
             from sqlalchemy.orm import sessionmaker  # noqa: F401
             from sqlalchemy.ext.declarative import declarative_base
@@ -350,6 +367,7 @@ class SqlTenantStore(TenantStore):
             description = Column(Text)
             config_data = Column(Text, nullable=False)  # JSON string of TenantConfig
             is_active = Column(Boolean, default=True)
+            version = Column(Integer, nullable=False, default=0)  # optimistic lock
             created_at = Column(DateTime, default=datetime.utcnow)
             updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -392,7 +410,10 @@ class SqlTenantStore(TenantStore):
                 return None
 
             config = TenantConfig.parse_raw(record.config_data)
-            return config.to_tenant()
+            tenant = config.to_tenant()
+            # The row's version column is authoritative for optimistic locking.
+            tenant.version = record.version
+            return tenant
         finally:
             await session.close()
 
@@ -446,6 +467,7 @@ class SqlTenantStore(TenantStore):
             # Create new tenant record
             tenant.created_at = datetime.utcnow()
             tenant.updated_at = datetime.utcnow()
+            tenant.version = 0
 
             config = TenantConfig.from_tenant(tenant)
             record = self._TenantRecord(
@@ -454,6 +476,7 @@ class SqlTenantStore(TenantStore):
                 description=tenant.description,
                 config_data=config.json(),
                 is_active=tenant.is_active,
+                version=tenant.version,
                 created_at=tenant.created_at,
                 updated_at=tenant.updated_at,
             )
@@ -471,32 +494,61 @@ class SqlTenantStore(TenantStore):
             await session.close()
 
     async def update_tenant(self, tenant: Tenant) -> Tenant:
-        """Update tenant in SQL storage."""
+        """Update tenant in SQL storage with optimistic locking.
+
+        The update applies only when the caller's ``tenant.version`` matches
+        the stored row version; otherwise :class:`OptimisticLockError` is
+        raised so the caller can re-read and retry.
+
+        Args:
+            tenant: Tenant object with updated fields (``version`` must come
+                from a recent read).
+
+        Returns:
+            Updated tenant object with the new version.
+
+        Raises:
+            ValueError: Tenant does not exist.
+            OptimisticLockError: A concurrent writer updated the row first.
+        """
         session = await self._get_session()
 
         try:
-            from sqlalchemy import select
+            from sqlalchemy import select, update
 
             # Check if tenant exists
             existing = await session.execute(
-                select(self._TenantRecord).where(self._TenantRecord.tenant_id == tenant.tenant_id))
-            record = existing.scalar_one_or_none()
-            if not record:
+                select(self._TenantRecord.version).where(self._TenantRecord.tenant_id == tenant.tenant_id))
+            stored_version = existing.scalar_one_or_none()
+            if stored_version is None:
                 raise ValueError(f"Tenant {tenant.tenant_id} not found")
 
-            # Update tenant record
+            # Optimistic concurrent update: only succeeds when the stored
+            # version still matches what the caller read. The persisted
+            # config JSON carries the *new* version so reads stay consistent.
+            expected_version = tenant.version
             tenant.updated_at = datetime.utcnow()
-            config = TenantConfig.from_tenant(tenant)
+            updated_snapshot = TenantConfig.from_tenant(_tenant_with_version(tenant, expected_version + 1))
 
-            record.name = tenant.name
-            record.description = tenant.description
-            record.config_data = config.json()
-            record.is_active = tenant.is_active
-            record.updated_at = tenant.updated_at
-
+            new_values = {
+                "name": tenant.name,
+                "description": tenant.description,
+                "config_data": updated_snapshot.json(),
+                "is_active": tenant.is_active,
+                "version": self._TenantRecord.version + 1,
+                "updated_at": tenant.updated_at,
+            }
+            stmt = update(self._TenantRecord).where(self._TenantRecord.tenant_id == tenant.tenant_id,
+                                                    self._TenantRecord.version == expected_version).values(**new_values)
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.rollback()
+                raise OptimisticLockError(f"Tenant {tenant.tenant_id} was modified concurrently "
+                                          f"(expected version {expected_version}, stored version {stored_version})")
             await session.commit()
 
-            logger.info(f"Updated tenant in SQL: {tenant.tenant_id}")
+            tenant.version = int(stored_version) + 1
+            logger.info(f"Updated tenant in SQL: {tenant.tenant_id} (v{tenant.version})")
             return tenant
         except Exception:
             await session.rollback()

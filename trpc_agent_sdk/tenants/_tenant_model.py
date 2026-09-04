@@ -125,6 +125,9 @@ class Tenant:
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = True
+    # Optimistic-lock revision, incremented by the SQL store on each update;
+    # carries over the config round-trip so concurrent writers are detected.
+    version: int = 0
 
     def get_channel_config(self, channel_type: str) -> Optional[ChannelConfig]:
         """Get configuration for a specific channel type."""
@@ -162,6 +165,7 @@ class TenantConfig(BaseModel):
 
     custom_attributes: Dict[str, Any] = field(default_factory=dict)
     is_active: bool = True
+    version: int = 0
 
     def to_tenant(self) -> Tenant:
         """Convert Pydantic model to Tenant dataclass."""
@@ -180,6 +184,7 @@ class TenantConfig(BaseModel):
             audit_config=AuditConfig(**self.audit_config) if self.audit_config else AuditConfig(),
             custom_attributes=self.custom_attributes,
             is_active=self.is_active,
+            version=self.version,
         )
 
     @classmethod
@@ -200,4 +205,5 @@ class TenantConfig(BaseModel):
             audit_config=tenant.audit_config.__dict__,
             custom_attributes=tenant.custom_attributes,
             is_active=tenant.is_active,
+            version=tenant.version,
         )

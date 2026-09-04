@@ -23,6 +23,7 @@ from ._tenant_model import (
     AuditConfig,
 )
 from ._tenant_store import (
+    OptimisticLockError,
     TenantStore,
     InMemoryTenantStore,
     RedisTenantStore,
@@ -101,6 +102,22 @@ from ._tenant_telemetry import (
     inject_trace_headers,
     reset_tenant_metrics,
 )
+from ._tenant_memory import TenantScopedMemoryService
+from ._tenant_vector import (
+    InMemoryVectorBackend,
+    VectorBackend,
+    VectorRecord,
+)
+from ._sql_ddl import (
+    TENANT_TABLE_NAMES,
+    TENANT_TABLES_DDL_MYSQL,
+    TENANT_TABLES_DDL_SQLITE,
+)
+from ._sql_migrations import (
+    MIGRATIONS,
+    Migration,
+    SchemaMigrator,
+)
 
 __all__ = [
     # Data models
@@ -114,6 +131,7 @@ __all__ = [
     "AuditConfig",
 
     # Storage backends
+    "OptimisticLockError",
     "TenantStore",
     "InMemoryTenantStore",
     "RedisTenantStore",
@@ -192,4 +210,20 @@ __all__ = [
     "get_tenant_metrics",
     "inject_trace_headers",
     "reset_tenant_metrics",
+
+    # Memory scoping
+    "TenantScopedMemoryService",
+
+    # Vector store
+    "VectorBackend",
+    "VectorRecord",
+    "InMemoryVectorBackend",
+
+    # SQL schema (DDL + migrations)
+    "TENANT_TABLE_NAMES",
+    "TENANT_TABLES_DDL_SQLITE",
+    "TENANT_TABLES_DDL_MYSQL",
+    "Migration",
+    "MIGRATIONS",
+    "SchemaMigrator",
 ]
