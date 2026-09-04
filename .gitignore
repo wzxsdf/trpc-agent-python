@@ -28,3 +28,4 @@ pyrightconfig.json
 
 # spec-workflow tool artifacts
 .spec-workflow
+tests/tenants/_e2e_env.txt
