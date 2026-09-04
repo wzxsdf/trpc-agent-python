@@ -157,6 +157,11 @@ class TenantAuditLogger:
             audit_log: The entry to persist.
         """
         try:
+            if not audit_log.trace_id:
+                # Auto-correlate with the active OpenTelemetry trace.
+                from trpc_agent_sdk.tenants._tenant_telemetry import current_trace_id
+
+                audit_log.trace_id = current_trace_id()
             data = audit_log.to_dict()
             if self._mask_details and data.get("details"):
                 data["details"] = mask_secrets(data["details"])

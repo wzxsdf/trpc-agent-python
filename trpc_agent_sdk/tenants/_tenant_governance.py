@@ -41,6 +41,7 @@ from ._audit import (
     mask_secrets,
 )
 from ._tenant_context import TenantContext
+from ._tenant_telemetry import get_tenant_metrics
 
 ConfirmCallback = Callable[[str, Dict[str, Any]], Awaitable[bool]]
 """Async callable(tool_name, args) -> bool deciding whether a dangerous tool
@@ -163,6 +164,19 @@ class TenantUsageTracker:
             "output_tokens": output_tokens,
             "cost_micros": cost_micros,
         }
+
+        # Mirror usage into the Prometheus metrics registry (explicit token
+        # counts only — event-stream tokens are counted in TenantRunner).
+        metrics = get_tenant_metrics()
+        if estimated_cost_usd:
+            metrics.incr("tenant_cost_usd_total", {"tenant_id": tenant_context.tenant_id}, estimated_cost_usd)
+        if input_tokens:
+            metrics.incr("tenant_tokens_total", {"tenant_id": tenant_context.tenant_id, "type": "input"}, input_tokens)
+        if output_tokens:
+            metrics.incr("tenant_tokens_total", {
+                "tenant_id": tenant_context.tenant_id,
+                "type": "output"
+            }, output_tokens)
 
         if not self._redis_failed:
             try:

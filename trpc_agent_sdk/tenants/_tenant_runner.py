@@ -10,8 +10,10 @@ keys + tenant state verification). :class:`TenantRunner` adds optional event
 sanitization on top of a standard :class:`Runner`.
 """
 
+import time
 from typing import AsyncGenerator, Optional
 
+from opentelemetry import trace
 from trpc_agent_sdk.agents import BaseAgent, LlmAgent
 from trpc_agent_sdk.context import AgentContext
 from trpc_agent_sdk.configs import RunConfig
@@ -25,6 +27,16 @@ from ._audit import TenantAuditLogger, mask_secrets
 from ._tenant_context import TenantContext
 from ._tenant_governance import ConfirmCallback, TenantGovernanceFilter, TenantToolGovernor, TenantUsageTracker
 from ._tenant_session_service import TenantAwareSessionService
+from ._tenant_telemetry import TRACER, TenantTelemetryHooks, get_tenant_metrics
+
+
+def _append_callback(existing, callback):
+    """Append ``callback`` to an SDK callback field (None / callable / list)."""
+    if existing is None:
+        return callback
+    if isinstance(existing, list):
+        return [*existing, callback]
+    return [existing, callback]
 
 
 class TenantRunner:
@@ -83,18 +95,48 @@ class TenantRunner:
             Events from agent execution, sanitized per tenant audit config.
         """
         logger.debug(f"Tenant {self._tenant_id} run: user={user_id}, session={session_id}")
+        metrics = get_tenant_metrics()
+        metrics.incr("tenant_requests_total", {"tenant_id": self._tenant_id})
         if self._usage_tracker is not None:
             await self._usage_tracker.record_usage(self._tenant_context, requests=1)
-        async for event in self._base_runner.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=new_message,
-                run_config=run_config,
-                agent_context=agent_context,
-        ):
-            if self._tenant_context.should_sanitize_tool_inputs():
-                event = self._sanitize_event(event)
-            yield event
+        started = time.monotonic()
+        with TRACER.start_as_current_span("tenant.runner.run") as span:
+            span.set_attribute("tenant.id", self._tenant_id)
+            span.set_attribute("tenant.user_id", user_id)
+            span.set_attribute("tenant.session_id", session_id)
+            try:
+                async for event in self._base_runner.run_async(
+                        user_id=user_id,
+                        session_id=session_id,
+                        new_message=new_message,
+                        run_config=run_config,
+                        agent_context=agent_context,
+                ):
+                    self._record_token_usage(event)
+                    if self._tenant_context.should_sanitize_tool_inputs():
+                        event = self._sanitize_event(event)
+                    yield event
+            except Exception as e:
+                metrics.incr("tenant_errors_total", {"tenant_id": self._tenant_id, "error_type": type(e).__name__})
+                span.record_exception(e)
+                span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                raise
+            finally:
+                metrics.observe("tenant_run_latency_ms", {"tenant_id": self._tenant_id},
+                                (time.monotonic() - started) * 1000)
+
+    def _record_token_usage(self, event: Event) -> None:
+        """Count model token consumption reported in event usage metadata."""
+        usage = getattr(event, "usage_metadata", None)
+        if usage is None:
+            return
+        metrics = get_tenant_metrics()
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        if prompt_tokens:
+            metrics.incr("tenant_tokens_total", {"tenant_id": self._tenant_id, "type": "input"}, prompt_tokens)
+        if completion_tokens:
+            metrics.incr("tenant_tokens_total", {"tenant_id": self._tenant_id, "type": "output"}, completion_tokens)
 
     def _sanitize_event(self, event: Event) -> Event:
         """Mask secret-looking values in function-call args."""
@@ -164,7 +206,16 @@ async def create_tenant_runner(
     if isinstance(agent, LlmAgent):
         existing = agent.before_tool_callback
         callbacks = existing if isinstance(existing, list) else ([existing] if existing else [])
-        agent.before_tool_callback = [*callbacks, governor.before_tool_callback()]
+        # Model/tool latency telemetry callbacks (never deny, return None).
+        telemetry_hooks = TenantTelemetryHooks(tenant_context.tenant_id)
+        agent.before_tool_callback = [
+            *callbacks,
+            governor.before_tool_callback(),
+            telemetry_hooks.before_tool,
+        ]
+        agent.after_tool_callback = _append_callback(agent.after_tool_callback, telemetry_hooks.after_tool)
+        agent.before_model_callback = _append_callback(agent.before_model_callback, telemetry_hooks.before_model)
+        agent.after_model_callback = _append_callback(agent.after_model_callback, telemetry_hooks.after_model)
 
     # Run-level governance: budget check + audit as an agent filter.
     if usage_tracker is not None:

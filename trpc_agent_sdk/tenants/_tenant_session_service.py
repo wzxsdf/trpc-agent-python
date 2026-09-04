@@ -10,8 +10,14 @@ Wraps any ``BaseSessionService`` and enforces tenant isolation by:
 - injecting ``tenant_id`` into the session ``state`` (ownership verification)
 
 The public interface matches :class:`trpc_agent_sdk.abc.SessionServiceABC`.
+
+Every delegated backend call is timed into the
+``tenant_session_backend_latency_ms{tenant_id, operation}`` histogram, which
+gives per-tenant visibility into session-store latency (useful for
+capacity planning and for spotting slow shared backends).
 """
 
+import time
 from typing import Optional
 
 from typing_extensions import override
@@ -23,6 +29,7 @@ from trpc_agent_sdk.sessions import BaseSessionService
 from trpc_agent_sdk.sessions import Session
 
 from ._tenant_context import TenantContext
+from ._tenant_telemetry import get_tenant_metrics
 
 TENANT_STATE_KEY = "tenant_id"
 
@@ -60,6 +67,29 @@ class TenantAwareSessionService(BaseSessionService):
             return scoped_session_id[len(prefix):]
         return scoped_session_id
 
+    async def _timed_call(self, operation: str, coro):
+        """Await a backend coroutine while timing it into the metrics registry.
+
+        Args:
+            operation: Backend operation name (used as a metric label).
+            coro: The coroutine to await.
+
+        Returns:
+            Whatever the coroutine returns.
+        """
+        started = time.monotonic()
+        try:
+            return await coro
+        finally:
+            get_tenant_metrics().observe(
+                "tenant_session_backend_latency_ms",
+                {
+                    "tenant_id": self._tenant_id,
+                    "operation": operation
+                },
+                (time.monotonic() - started) * 1000,
+            )
+
     @override
     async def create_session(
         self,
@@ -77,13 +107,15 @@ class TenantAwareSessionService(BaseSessionService):
         scoped_id = self.scope_session_id(session_id) if session_id else None
         logger.debug(f"Creating session for tenant {self._tenant_id}, user {user_id}")
 
-        return await self._base_service.create_session(
-            app_name=app_name,
-            user_id=user_id,
-            state=state,
-            session_id=scoped_id,
-            agent_context=agent_context,
-        )
+        return await self._timed_call(
+            "create",
+            self._base_service.create_session(
+                app_name=app_name,
+                user_id=user_id,
+                state=state,
+                session_id=scoped_id,
+                agent_context=agent_context,
+            ))
 
     @override
     async def get_session(
@@ -95,12 +127,14 @@ class TenantAwareSessionService(BaseSessionService):
         agent_context: Optional[AgentContext] = None,
     ) -> Optional[Session]:
         """Get a session, rejecting sessions owned by another tenant."""
-        session = await self._base_service.get_session(
-            app_name=app_name,
-            user_id=user_id,
-            session_id=self.scope_session_id(session_id),
-            agent_context=agent_context,
-        )
+        session = await self._timed_call(
+            "get",
+            self._base_service.get_session(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=self.scope_session_id(session_id),
+                agent_context=agent_context,
+            ))
         if session is None:
             return None
         if session.state.get(TENANT_STATE_KEY) != self._tenant_id:
@@ -116,7 +150,7 @@ class TenantAwareSessionService(BaseSessionService):
         user_id: Optional[str] = None,
     ) -> ListSessionsResponse:
         """List sessions belonging to this tenant only."""
-        response = await self._base_service.list_sessions(app_name=app_name, user_id=user_id)
+        response = await self._timed_call("list", self._base_service.list_sessions(app_name=app_name, user_id=user_id))
         prefix = f"{self._tenant_id}:"
         response.sessions = [s for s in response.sessions if s.id.startswith(prefix)]
         return response
@@ -124,21 +158,23 @@ class TenantAwareSessionService(BaseSessionService):
     @override
     async def delete_session(self, *, app_name: str, user_id: str, session_id: str) -> None:
         """Delete a session (tenant-scoped key)."""
-        await self._base_service.delete_session(
-            app_name=app_name,
-            user_id=user_id,
-            session_id=self.scope_session_id(session_id),
-        )
+        await self._timed_call(
+            "delete",
+            self._base_service.delete_session(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=self.scope_session_id(session_id),
+            ))
 
     @override
     async def append_event(self, session: Session, event) -> Session:
         """Append an event; the session already carries its scoped id."""
-        return await self._base_service.append_event(session, event)
+        return await self._timed_call("append_event", self._base_service.append_event(session, event))
 
     @override
     async def update_session(self, session: Session) -> None:
         """Persist session changes."""
-        await self._base_service.update_session(session)
+        await self._timed_call("update", self._base_service.update_session(session))
 
     def get_tenant_id(self) -> str:
         """Return the tenant id this service is scoped to."""

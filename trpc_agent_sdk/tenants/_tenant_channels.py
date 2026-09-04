@@ -32,6 +32,7 @@ from ._audit import (
 from ._im_transport import (MessageChunker, RateLimiter, TelegramSender, WeComSender, send_with_retry)
 from ._tenant_model import Tenant
 from ._tenant_store import TenantStore
+from ._tenant_telemetry import TRACER, extract_trace_headers, get_tenant_metrics
 
 
 @dataclass
@@ -604,22 +605,30 @@ class TenantChannelManager:
             logger.warning(f"Unsupported channel type: {channel_type}")
             return None
 
-        # Process webhook through adapter
-        message = await adapter.handle_webhook(channel_type, payload, headers)
-        if not message:
-            await self._audit(f"unknown:{channel_type}", DECISION_IM_REJECTED, None,
-                              {"reason": "authentication or signature failed"})
-            return None
+        # Root span for the inbound IM request; continues an upstream trace
+        # when the platform/gateway forwarded a W3C traceparent header.
+        with extract_trace_headers(headers), TRACER.start_as_current_span("tenant.im.callback") as span:
+            span.set_attribute("tenant.channel", channel_type)
+            message = await adapter.handle_webhook(channel_type, payload, headers)
+            if not message:
+                span.set_attribute("tenant.accepted", False)
+                await self._audit(f"unknown:{channel_type}", DECISION_IM_REJECTED, None,
+                                  {"reason": "authentication or signature failed"})
+                return None
 
-        # Check for duplicate messages
-        is_duplicate = await self._deduplicator.is_duplicate(message)
-        if is_duplicate:
-            logger.info(f"Duplicate message filtered: {message.message_id}")
-            await self._audit(message.tenant_id, DECISION_IM_DUPLICATE, message)
-            return None
+            span.set_attribute("tenant.id", message.tenant_id)
+            span.set_attribute("tenant.accepted", True)
+            span.set_attribute("tenant.message_id", message.message_id)
 
-        await self._audit(message.tenant_id, DECISION_IM_RECEIVED, message)
-        return message
+            # Check for duplicate messages
+            is_duplicate = await self._deduplicator.is_duplicate(message)
+            if is_duplicate:
+                logger.info(f"Duplicate message filtered: {message.message_id}")
+                await self._audit(message.tenant_id, DECISION_IM_DUPLICATE, message)
+                return None
+
+            await self._audit(message.tenant_id, DECISION_IM_RECEIVED, message)
+            return message
 
     async def send_response(self, response: TenantResponse) -> bool:
         """Send response to appropriate IM platform.
@@ -663,40 +672,51 @@ class TenantChannelManager:
         Returns:
             Per-chunk delivery results (True = delivered).
         """
-        text_parts: List[str] = []
-        async for event in events:
-            if event.partial:
-                continue
-            event_text = event.get_text()
-            if event_text:
-                text_parts.append(event_text)
+        metrics = get_tenant_metrics()
+        with TRACER.start_as_current_span("tenant.im.reply") as span:
+            span.set_attribute("tenant.id", message.tenant_id)
+            span.set_attribute("tenant.channel", message.channel_type)
+            span.set_attribute("tenant.message_id", message.message_id)
+            text_parts: List[str] = []
+            async for event in events:
+                if event.partial:
+                    continue
+                event_text = event.get_text()
+                if event_text:
+                    text_parts.append(event_text)
 
-        reply_text = "".join(text_parts).strip()
-        if not reply_text:
-            logger.warning(f"Agent produced no reply for message {message.message_id}")
-            return []
+            reply_text = "".join(text_parts).strip()
+            if not reply_text:
+                logger.warning(f"Agent produced no reply for message {message.message_id}")
+                return []
 
-        chunks = MessageChunker.split_text(reply_text, MessageChunker.limit_for(message.channel_type))
-        results: List[bool] = []
-        for chunk in chunks:
-            response = TenantResponse(
-                tenant_id=message.tenant_id,
-                channel_type=message.channel_type,
-                user_id=message.user_id,
-                chat_id=message.chat_id,
-                content=chunk,
-                reply_to_message_id=message.message_id,
-            )
-            delivered = await send_with_retry(lambda r=response: self.send_response(r))
-            results.append(delivered)
-            await self._audit(
-                message.tenant_id,
-                DECISION_IM_REPLIED if delivered else DECISION_IM_REPLY_FAILED,
-                message,
-                {} if delivered else {"chunk": chunk[:100]},
-                error_type="" if delivered else "IMDeliveryError",
-            )
-        return results
+            chunks = MessageChunker.split_text(reply_text, MessageChunker.limit_for(message.channel_type))
+            results: List[bool] = []
+            for chunk in chunks:
+                response = TenantResponse(
+                    tenant_id=message.tenant_id,
+                    channel_type=message.channel_type,
+                    user_id=message.user_id,
+                    chat_id=message.chat_id,
+                    content=chunk,
+                    reply_to_message_id=message.message_id,
+                )
+                delivered = await send_with_retry(lambda r=response: self.send_response(r))
+                results.append(delivered)
+                metrics.incr(
+                    "tenant_im_reply_total", {
+                        "tenant_id": message.tenant_id,
+                        "channel": message.channel_type,
+                        "result": "success" if delivered else "failed",
+                    })
+                await self._audit(
+                    message.tenant_id,
+                    DECISION_IM_REPLIED if delivered else DECISION_IM_REPLY_FAILED,
+                    message,
+                    {} if delivered else {"chunk": chunk[:100]},
+                    error_type="" if delivered else "IMDeliveryError",
+                )
+            return results
 
     async def run_and_reply(self, runner, message: TenantMessage, run_config: Optional[Any] = None) -> List[bool]:
         """Run the tenant agent for an IM message and deliver its reply.

@@ -92,6 +92,15 @@ from ._tenant_governance import (
     TenantUsageTracker,
     check_im_user_allowed,
 )
+from ._tenant_telemetry import (
+    TenantMetrics,
+    TenantTelemetryHooks,
+    current_trace_id,
+    extract_trace_headers,
+    get_tenant_metrics,
+    inject_trace_headers,
+    reset_tenant_metrics,
+)
 
 __all__ = [
     # Data models
@@ -174,4 +183,13 @@ __all__ = [
     "TenantToolGovernor",
     "TenantUsageTracker",
     "check_im_user_allowed",
+
+    # Telemetry (tracing + metrics)
+    "TenantMetrics",
+    "TenantTelemetryHooks",
+    "current_trace_id",
+    "extract_trace_headers",
+    "get_tenant_metrics",
+    "inject_trace_headers",
+    "reset_tenant_metrics",
 ]
