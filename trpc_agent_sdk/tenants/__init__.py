@@ -21,6 +21,7 @@ from ._tenant_model import (
     ChannelConfig,
     StorageConfig,
     AuditConfig,
+    ResilienceConfig,
 )
 from ._tenant_store import (
     OptimisticLockError,
@@ -117,6 +118,31 @@ from ._sql_migrations import (
     MIGRATIONS,
     Migration,
     SchemaMigrator,
+)
+from ._tenant_resilience import (
+    TenantToolResilienceHooks,
+    ToolCircuitBreaker,
+)
+from ._tenant_degradation import (
+    BackendHealth,
+    DegradationController,
+    TenantStoreWithFallback,
+    get_degradation_controller,
+)
+from ._tenant_rollout import (
+    ConfigHistoryEntry,
+    ConfigRolloutManager,
+    InMemoryConfigHistory,
+    RolloutState,
+    user_bucket,
+)
+from ._tenant_capacity import (
+    CapacityReport,
+    TenantCapacityRow,
+    budget_headroom,
+    capacity_plan,
+    nodes_for_qps,
+    project_month_end_usage,
 )
 
 __all__ = [
@@ -226,4 +252,30 @@ __all__ = [
     "Migration",
     "MIGRATIONS",
     "SchemaMigrator",
+
+    # Resilience (circuit breaker, failure policies)
+    "ResilienceConfig",
+    "ToolCircuitBreaker",
+    "TenantToolResilienceHooks",
+
+    # Storage degradation (primary/fallback with health recovery)
+    "BackendHealth",
+    "DegradationController",
+    "TenantStoreWithFallback",
+    "get_degradation_controller",
+
+    # Canary rollout & config rollback
+    "ConfigRolloutManager",
+    "ConfigHistoryEntry",
+    "InMemoryConfigHistory",
+    "RolloutState",
+    "user_bucket",
+
+    # Capacity planning
+    "CapacityReport",
+    "TenantCapacityRow",
+    "budget_headroom",
+    "capacity_plan",
+    "nodes_for_qps",
+    "project_month_end_usage",
 ]

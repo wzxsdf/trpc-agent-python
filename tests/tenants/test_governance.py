@@ -299,6 +299,7 @@ class TestCreateTenantRunnerWiring:
         governance_filters = [f for f in agent.filters if isinstance(f, TenantGovernanceFilter)]
         assert len(governance_filters) == 1
         # Tool governance callback wired into the agent's before_tool_callback
-        # (list also contains the telemetry timing callback added in phase 3)
+        # (list also contains the resilience circuit-breaker callback added in
+        # phase 5 and the telemetry timing callback added in phase 3)
         callbacks = agent.before_tool_callback
-        assert isinstance(callbacks, list) and len(callbacks) == 2
+        assert isinstance(callbacks, list) and len(callbacks) == 3

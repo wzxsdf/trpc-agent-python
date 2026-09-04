@@ -105,6 +105,32 @@ class AuditConfig:
 
 
 @dataclass
+class ResilienceConfig:
+    """Tenant-level fault-tolerance policy (model failure, tool failure).
+
+    - ``model_failure_action``: what a run does when the model call fails
+      after retries — ``"error"`` propagates the exception, ``"fallback"``
+      yields a synthetic event with ``model_fallback_text`` instead.
+    - ``tool_failure_policy``: ``"closed"`` (fail-closed) propagates tool
+      errors; ``"open"`` (fail-open) lets the run continue with the tool
+      marked failed. Either way the per-tool circuit breaker
+      (:class:`~trpc_agent_sdk.tenants.ToolCircuitBreaker`) stops repeated
+      calls to a failing tool once ``circuit_failure_threshold`` consecutive
+      failures are recorded.
+    """
+
+    model_timeout_seconds: int = 30
+    model_max_retries: int = 3
+    model_failure_action: str = "error"  # 'error' | 'fallback'
+    model_fallback_text: str = "The assistant is temporarily unavailable. Please try again later."
+
+    tool_failure_policy: str = "closed"  # 'open' | 'closed'
+    circuit_breaker_enabled: bool = True
+    circuit_failure_threshold: int = 5
+    circuit_reset_seconds: int = 60
+
+
+@dataclass
 class Tenant:
     """Core tenant model representing a multi-tenant organization."""
 
@@ -119,6 +145,7 @@ class Tenant:
     channel_configs: Dict[str, ChannelConfig] = field(default_factory=dict)
     storage_config: StorageConfig = field(default_factory=StorageConfig)
     audit_config: AuditConfig = field(default_factory=AuditConfig)
+    resilience_config: ResilienceConfig = field(default_factory=ResilienceConfig)
 
     # Metadata
     custom_attributes: Dict[str, Any] = field(default_factory=dict)
@@ -128,6 +155,9 @@ class Tenant:
     # Optimistic-lock revision, incremented by the SQL store on each update;
     # carries over the config round-trip so concurrent writers are detected.
     version: int = 0
+    # Config release version for canary rollout / rollback (see
+    # trpc_agent_sdk.tenants.TenantRolloutManager).
+    config_version: int = 1
 
     def get_channel_config(self, channel_type: str) -> Optional[ChannelConfig]:
         """Get configuration for a specific channel type."""
@@ -162,10 +192,12 @@ class TenantConfig(BaseModel):
     channel_configs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     storage_config: Dict[str, Any] = field(default_factory=dict)
     audit_config: Dict[str, Any] = field(default_factory=dict)
+    resilience_config: Dict[str, Any] = field(default_factory=dict)
 
     custom_attributes: Dict[str, Any] = field(default_factory=dict)
     is_active: bool = True
     version: int = 0
+    config_version: int = 1
 
     def to_tenant(self) -> Tenant:
         """Convert Pydantic model to Tenant dataclass."""
@@ -182,9 +214,12 @@ class TenantConfig(BaseModel):
             },
             storage_config=StorageConfig(**self.storage_config) if self.storage_config else StorageConfig(),
             audit_config=AuditConfig(**self.audit_config) if self.audit_config else AuditConfig(),
+            resilience_config=(ResilienceConfig(
+                **self.resilience_config) if self.resilience_config else ResilienceConfig()),
             custom_attributes=self.custom_attributes,
             is_active=self.is_active,
             version=self.version,
+            config_version=self.config_version,
         )
 
     @classmethod
@@ -203,7 +238,9 @@ class TenantConfig(BaseModel):
             },
             storage_config=tenant.storage_config.__dict__,
             audit_config=tenant.audit_config.__dict__,
+            resilience_config=tenant.resilience_config.__dict__,
             custom_attributes=tenant.custom_attributes,
             is_active=tenant.is_active,
             version=tenant.version,
+            config_version=tenant.config_version,
         )

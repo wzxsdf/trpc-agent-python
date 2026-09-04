@@ -11,8 +11,10 @@ sanitization on top of a standard :class:`Runner`.
 """
 
 import time
+import uuid
 from typing import AsyncGenerator, Optional
 
+from google.genai import types as genai_types
 from opentelemetry import trace
 from trpc_agent_sdk.agents import BaseAgent, LlmAgent
 from trpc_agent_sdk.context import AgentContext
@@ -26,6 +28,7 @@ from trpc_agent_sdk.types import Content
 from ._audit import TenantAuditLogger, mask_secrets
 from ._tenant_context import TenantContext
 from ._tenant_governance import ConfirmCallback, TenantGovernanceFilter, TenantToolGovernor, TenantUsageTracker
+from ._tenant_resilience import TenantToolResilienceHooks, ToolCircuitBreaker
 from ._tenant_session_service import TenantAwareSessionService
 from ._tenant_telemetry import TRACER, TenantTelemetryHooks, get_tenant_metrics
 
@@ -120,6 +123,23 @@ class TenantRunner:
                 metrics.incr("tenant_errors_total", {"tenant_id": self._tenant_id, "error_type": type(e).__name__})
                 span.record_exception(e)
                 span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
+                # Tenant-level model failure policy: degrade to a canned
+                # fallback message instead of propagating the error.
+                resilience = self._tenant_context.tenant.resilience_config
+                if resilience.model_failure_action == "fallback":
+                    agent_name = getattr(getattr(self._base_runner, "agent", None), "name", "") or ""
+                    logger.warning(f"Tenant {self._tenant_id}: model failed ({type(e).__name__}), "
+                                   f"degrading to fallback response")
+                    yield Event(
+                        invocation_id=uuid.uuid4().hex,
+                        author=agent_name,
+                        content=genai_types.Content(
+                            role="model",
+                            parts=[genai_types.Part(text=resilience.model_fallback_text)],
+                        ),
+                        turn_complete=True,
+                    )
+                    return
                 raise
             finally:
                 metrics.observe("tenant_run_latency_ms", {"tenant_id": self._tenant_id},
@@ -208,9 +228,28 @@ async def create_tenant_runner(
         callbacks = existing if isinstance(existing, list) else ([existing] if existing else [])
         # Model/tool latency telemetry callbacks (never deny, return None).
         telemetry_hooks = TenantTelemetryHooks(tenant_context.tenant_id)
+        # Tool failure policy: circuit breaker short-circuits a failing tool
+        # (fail-closed) per the tenant's resilience config.
+        resilience_config = tenant_context.tenant.resilience_config
+        before_tool_extra = []
+        if resilience_config.circuit_breaker_enabled and resilience_config.tool_failure_policy == "closed":
+            breaker = ToolCircuitBreaker(
+                failure_threshold=resilience_config.circuit_failure_threshold,
+                reset_seconds=resilience_config.circuit_reset_seconds,
+            )
+            resilience_hooks = TenantToolResilienceHooks(
+                tenant_id=tenant_context.tenant_id,
+                breaker=breaker,
+                tool_failure_policy=resilience_config.tool_failure_policy,
+                audit_logger=audit_logger,
+            )
+            before_tool_extra.append(resilience_hooks.before_tool_callback())
+            agent.after_tool_callback = _append_callback(agent.after_tool_callback,
+                                                         resilience_hooks.after_tool_callback())
         agent.before_tool_callback = [
             *callbacks,
             governor.before_tool_callback(),
+            *before_tool_extra,
             telemetry_hooks.before_tool,
         ]
         agent.after_tool_callback = _append_callback(agent.after_tool_callback, telemetry_hooks.after_tool)
