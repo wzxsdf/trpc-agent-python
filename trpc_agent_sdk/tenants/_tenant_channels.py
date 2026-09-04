@@ -11,13 +11,14 @@ isolation and message routing.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 
 from trpc_agent_sdk.log import logger
 
+from ._audit import DECISION_IM_DUPLICATE, DECISION_IM_RECEIVED, DECISION_IM_REJECTED, TenantAuditLogger
 from ._tenant_model import Tenant
 from ._tenant_store import TenantStore
 
@@ -501,21 +502,45 @@ class TenantChannelManager:
     Coordinates channel adapters, message deduplication, and tenant routing.
     """
 
-    def __init__(self, tenant_store: TenantStore, redis_url: str = "redis://localhost:6379/0"):
+    def __init__(self,
+                 tenant_store: TenantStore,
+                 redis_url: str = "redis://localhost:6379/0",
+                 audit_logger_factory: Optional[Callable[[str], TenantAuditLogger]] = None):
         """Initialize tenant channel manager.
 
         Args:
             tenant_store: Tenant storage backend
             redis_url: Redis URL for deduplication
+            audit_logger_factory: Optional factory creating a per-tenant
+                :class:`~trpc_agent_sdk.tenants.TenantAuditLogger`; when set,
+                webhook accept/reject/duplicate decisions are audited.
         """
         self._tenant_store = tenant_store
         self._deduplicator = MessageDeduplicator(redis_url)
+        self._audit_logger_factory = audit_logger_factory
 
         # Register channel adapters
         self._adapters = {
             "wecom": WeComTenantAdapter(tenant_store),
             "telegram": TelegramTenantAdapter(tenant_store),
         }
+
+    async def _audit(self,
+                     tenant_id: str,
+                     decision: str,
+                     message: Optional[TenantMessage],
+                     details: Optional[Dict[str, Any]] = None) -> None:
+        """Write an audit entry when an audit logger factory is configured."""
+        if self._audit_logger_factory is None:
+            return
+        audit_logger = self._audit_logger_factory(tenant_id)
+        await audit_logger.log_event(
+            decision=decision,
+            channel=message.channel_type if message else "unknown",
+            user_id=message.user_id if message else "",
+            session_id=message.session_id if message else "",
+            details=details or {},
+        )
 
     async def handle_webhook(self, channel_type: str, payload: Dict[str, Any],
                              headers: Dict[str, Any]) -> Optional[TenantMessage]:
@@ -537,14 +562,18 @@ class TenantChannelManager:
         # Process webhook through adapter
         message = await adapter.handle_webhook(channel_type, payload, headers)
         if not message:
+            await self._audit(f"unknown:{channel_type}", DECISION_IM_REJECTED, None,
+                              {"reason": "authentication or signature failed"})
             return None
 
         # Check for duplicate messages
         is_duplicate = await self._deduplicator.is_duplicate(message)
         if is_duplicate:
             logger.info(f"Duplicate message filtered: {message.message_id}")
+            await self._audit(message.tenant_id, DECISION_IM_DUPLICATE, message)
             return None
 
+        await self._audit(message.tenant_id, DECISION_IM_RECEIVED, message)
         return message
 
     async def send_response(self, response: TenantResponse) -> bool:

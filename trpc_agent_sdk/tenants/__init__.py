@@ -72,6 +72,19 @@ from ._tenant_channels import (
     MessageDeduplicator,
     TenantChannelManager,
 )
+from ._audit import (
+    AuditLog,
+    TenantAuditLogger,
+    mask_secrets,
+)
+from ._tenant_governance import (
+    BudgetCheck,
+    BudgetExceededError,
+    TenantGovernanceFilter,
+    TenantToolGovernor,
+    TenantUsageTracker,
+    check_im_user_allowed,
+)
 
 __all__ = [
     # Data models
@@ -134,4 +147,17 @@ __all__ = [
     "TelegramTenantAdapter",
     "MessageDeduplicator",
     "TenantChannelManager",
+
+    # Audit
+    "AuditLog",
+    "TenantAuditLogger",
+    "mask_secrets",
+
+    # Governance
+    "BudgetCheck",
+    "BudgetExceededError",
+    "TenantGovernanceFilter",
+    "TenantToolGovernor",
+    "TenantUsageTracker",
+    "check_im_user_allowed",
 ]
