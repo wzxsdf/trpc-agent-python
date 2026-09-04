@@ -1,8 +1,12 @@
 # 多租户架构实施完成总结
 
+> **诚实声明**：本总结区分「已实现并测试」与「设计蓝图」。已实现部分以
+> `trpc_agent_sdk/tenants/` 源码和 `tests/tenants/`（166 个单测，另有需真实
+> LLM 的 opt-in e2e）为准；未实现的（如 K8s 清单、监控面板）标注为设计目标。
+
 ## 🎉 项目完成概览
 
-经过系统的分析和实施，我们已经成功为 trpc-agent-python 项目构建了完整的多租户架构。这个架构提供了企业级的租户隔离、水平扩展能力，以及生产就绪的部署方案。
+经过系统的分析和实施，我们已经为 trpc-agent-python 项目构建了多租户架构。这个架构提供了租户隔离、水平扩展能力，以及部署方案设计。
 
 ## ✅ 已完成的核心组件
 
@@ -26,43 +30,63 @@
 - `_tenant_session_service.py` - 租户感知的Session服务
 - `_tenant_runner.py` - 租户感知的Agent Runner
 - `_unified_storage.py` - 统一的多后端数据访问层
+- `_tenant_memory.py` - Memory 跨节点租户前缀作用域
 
 **关键特性：**
 - ✅ 自动租户ID前缀注入，确保数据隔离
 - ✅ 租户级别的Session、Memory、Knowledge管理
 - ✅ 统一的数据访问接口，支持多种后端组合
-- ✅ 健康检查和故障恢复机制
 
 ### 3. IM通道适配层
 
 **核心文件：**
 - `_tenant_channels.py` - 多租户IM通道适配器
+- `_im_transport.py` - 发送重试/分片/限流（Redis 不可用时降级进程内实现）
 
 **关键特性：**
-- ✅ WeCom、Telegram等多平台支持
+- ✅ WeCom、Telegram多平台支持
 - ✅ 租户级别的消息路由和去重
 - ✅ Webhook签名验证
 - ✅ 灵活的Session ID生成策略
 
-### 4. 部署和运维方案
-
-**核心文档：**
-- `MULTI_TENANT_DEPLOYMENT.md` - 完整的部署拓扑设计
-- `docker-compose.yml` - 开发环境部署配置
-- Kubernetes配置 - 生产环境部署方案
-
-**关键特性：**
-- ✅ Gateway + Worker 架构设计
-- ✅ 水平扩展和无状态Worker实现
-- ✅ Redis Cluster + PostgreSQL HA存储方案
-- ✅ 监控、健康检查、优雅关闭机制
-
-### 5. 示例和文档
+### 4. 治理、监控与可观测（阶段三）
 
 **核心文件：**
-- `examples/multi_tenant_demo/` - 完整的使用示例
-- `README.md` - 详细的使用文档
-- `MULTI_TENANT_IMPLEMENTATION.md` - 实施指南
+- `_tenant_governance.py` - 工具白名单/危险工具确认/预算控制
+- `_tenant_telemetry.py` - OpenTelemetry 全链路 trace + 零依赖 Prometheus 指标
+- `_audit.py` - 11 字段审计日志 + 密钥脱敏 + trace_id 注入
+
+### 5. 数据一致性与存储（阶段四）
+
+**核心文件：**
+- `_sql_ddl.py` / `_sql_migrations.py` - 八表 DDL + 版本化迁移工具（checksum 防漂移）
+- `_tenant_store.py` - SQL 乐观锁并发控制（`OptimisticLockError`）
+- `_tenant_vector.py` - 向量库抽象 + InMemory 实现
+
+### 6. 故障恢复与运维（阶段五）
+
+**核心文件：**
+- `_tenant_resilience.py` - 租户级模型失败策略（error/fallback）+ 工具熔断
+- `_tenant_degradation.py` - 存储降级（primary/fallback + 健康探测恢复）
+- `_tenant_rollout.py` - 配置灰度发布与回滚（确定性哈希路由，无 sticky session）
+- `_tenant_capacity.py` - 容量评估纯函数（节点数/预算外推）
+
+### 7. 部署方案与文档
+
+**核心文件：**
+- `MULTI_TENANT_DEPLOYMENT.md` - 部署拓扑**设计蓝图**（Gateway/Worker 分层、
+  Redis Cluster、PostgreSQL HA、K8s 编排为设计方案，仓库不含可部署清单）
+- `examples/multi_tenant_demo/docker-compose.yml` - **已验证**的容器化冒烟环境
+  （Redis + demo 节点，`--scale demo=2` 验证多节点共享存储）
+- `MULTI_TENANT_CONSISTENCY.md` - 一致性策略与迁移工具
+- `MULTI_TENANT_OPERATIONS.md` - 故障恢复与运维 SOP
+
+### 8. 示例
+
+**核心文件：**
+- `examples/multi_tenant_demo/` - 使用示例（single_tenant / multi_tenant_integration /
+  full_stack_demo）
+- `examples/multi_tenant_demo/README.md` - 使用文档
 
 ## 🏗️ 架构设计亮点
 
@@ -138,7 +162,11 @@ Knowledge: VectorStore (搜索)  Audit: SQL (持久化)
 
 ## 📊 性能和扩展性
 
-### 性能指标
+> ⚠️ 以下为**设计目标，未经基准实测**。实测前请勿作为容量承诺；
+> 容量规划请使用 `_tenant_capacity.py` 的估算函数并接入真实指标
+> （见 `MULTI_TENANT_OPERATIONS.md` 第 4 节）。
+
+### 设计目标（未实测）
 
 **单Worker能力：**
 - 并发Session数: 20-50 (可配置)
@@ -150,7 +178,7 @@ Knowledge: VectorStore (搜索)  Audit: SQL (持久化)
 - 支持租户数: 1000+
 - 并发用户数: 10,000+
 - 日消息处理量: 1M+
-- 存储容量: 无限扩展
+- 存储容量: 随共享后端水平扩展
 
 ### 扩展策略
 
@@ -166,24 +194,23 @@ Knowledge: VectorStore (搜索)  Audit: SQL (持久化)
 
 ## 🔧 技术栈和依赖
 
-### 核心技术栈
+### 核心技术栈（以 `pyproject.toml` 与实现为准）
 ```python
 # 数据模型
-pydantic>=2.0
-dataclasses (Python 3.7+)
+pydantic>=2.11          # TenantConfig 序列化/校验
+dataclasses             # Tenant 等核心模型
 
-# 存储后端
-redis>=5.0          # Redis存储
-sqlalchemy>=2.0     # SQL存储
-asyncpg>=0.28       # PostgreSQL异步驱动
+# 存储后端（租户模块实际使用）
+redis>=6.2              # Redis 存储 / 去重 / 限流
+sqlalchemy>=2.0         # SQL 存储 + 同步迁移工具
+aiosqlite               # SQL 存储异步驱动（测试/开发）
 
-# IM平台
-nanobot             # WeCom集成
-python-telegram-bot # Telegram集成
+# IM 平台
+httpx                   # Telegram Bot API / WeCom webhook（无重型 SDK 依赖）
 
 # 监控和追踪
-opentelemetry-api>=1.0
-prometheus-client>=0.15
+opentelemetry-sdk       # 全链路 trace（W3C traceparent 跨节点传播）
+Prometheus 文本格式     # 零依赖自实现（未使用 prometheus-client）
 ```
 
 ### 部署技术栈
@@ -240,10 +267,12 @@ prometheus-client>=0.15
 ## 📈 项目成果
 
 ### 代码实现
-- **新增代码**: ~5,000行高质量Python代码
-- **核心模块**: 8个主要模块，30+个类
-- **测试覆盖**: 包含完整的集成示例
-- **文档**: 4份详细文档，3个可运行示例
+- **核心模块**: `trpc_agent_sdk/tenants/` 20+ 个模块，覆盖租户全生命周期
+- **测试覆盖**: `tests/tenants/` 166 个单测通过（另有需真实 LLM API 的 opt-in e2e 测试，
+  因演示 API 网关不可达未跑通，与功能代码无关）
+- **冒烟验证**: `examples/multi_tenant_demo/full_stack_demo.py` 9 项断言式检查
+  （存储/路由/IM/Runner 接线/熔断/降级/灰度/容量/指标），容器化入口见同目录 compose
+- **文档**: 4 份（部署蓝图 / 一致性 / 运维 / 本总结），均标注实现状态
 
 ### 技术价值
 - **架构**: 企业级多租户架构
@@ -285,21 +314,20 @@ prometheus-client>=0.15
 
 ## 🏁 结语
 
-这个多租户架构项目成功实现了企业级的AI Agent多租户系统，具备了：
+这个多租户架构项目为 trpc-agent-python 实现了 AI Agent 多租户系统的核心能力：
 
-1. **完整性**: 从数据模型到部署运维的全栈解决方案
-2. **生产就绪**: 包含监控、审计、容错等企业功能
-3. **可扩展性**: 支持从开发到生产的平滑升级
-4. **最佳实践**: 遵循行业标准的多租户设计模式
-
-该项目为 trpc-agent-python 框架增加了强大的多租户能力，使其能够支持大规模的商业部署，为企业级的AI Agent服务奠定了坚实的技术基础。
+1. **完整性**: 从数据模型到存储一致性、治理监控、故障恢复的全链路实现
+2. **有测试保障**: 166 个单测 + 9 项容器化冒烟检查
+3. **可扩展性**: 无 sticky session 设计，共享存储后可水平扩展
+4. **边界清晰**: 未实现部分（K8s 清单、监控面板、压测数据）已明确标注为设计目标
 
 ---
 
-**项目状态**: ✅ **核心功能已完成，可用于生产部署**
+**项目状态**: ✅ **SDK 层核心功能已实现并有单测覆盖；生产部署前需补齐：
+性能压测、K8s 编排清单、真实 IM webhook 联调、监控面板搭建**
 
 **下一步行动**:
-1. 在测试环境验证各项功能
-2. 根据具体业务需求调整配置
-3. 进行性能测试和优化
-4. 部署到生产环境并监控运行状态
+1. 使用 `docker-compose.yml` 在测试环境做多节点冒烟
+2. 按业务负载做性能压测（当前无实测数据）
+3. 替换真实模型 API 密钥并打通 IM webhook
+4. 依据 `MULTI_TENANT_OPERATIONS.md` 配置告警与灰度流程

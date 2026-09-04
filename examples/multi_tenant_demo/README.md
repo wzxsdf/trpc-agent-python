@@ -210,12 +210,39 @@ async def chat_endpoint(request: Request, x_tenant_id: str = Header(None)):
 
 ## Testing Different Tenants
 
-The example includes test scripts for different scenarios:
+The example includes runnable scripts:
 
 - `single_tenant.py` - Basic single-tenant usage
-- `multi_tenant.py` - Multiple tenants with isolation
-- `tenant_routing.py` - Advanced routing strategies
-- `tenant_permissions.py` - Tool permission isolation
+- `multi_tenant_integration.py` - End-to-end tour: routing, isolation, IM webhooks, runner setup
+- `full_stack_demo.py` - Container smoke entrypoint: runs 9 assertion-backed checks covering
+  storage, routing, IM, runner wiring, circuit breaker, degradation, canary rollout and capacity
+
+## Docker Smoke Test
+
+Run the multi-tenant stack with a shared Redis (requires Docker):
+
+```bash
+# Single node
+docker compose -f examples/multi_tenant_demo/docker-compose.yml up --build
+
+# Two demo nodes sharing Redis (no sticky session needed; the script is idempotent)
+docker compose -f examples/multi_tenant_demo/docker-compose.yml up --build --scale demo=2
+```
+
+Each demo replica prints "✅ 全部 9 项冒烟检查通过" and exits 0 on success
+(`docker compose up` shows `demo-1 exited with code 0`). Without Docker you can run
+the same script directly — it falls back to in-memory storage when `REDIS_URL` is unset:
+
+```bash
+python examples/multi_tenant_demo/full_stack_demo.py
+```
+
+## Real LLM (Optional)
+
+The demos verify the multi-tenant platform itself and do **not** call a model by default.
+To execute the agent against a real LLM, provide credentials via environment variables
+(`OPENAI_API_KEY`, optionally `OPENAI_BASE_URL`/model name) — the tenant's `ModelConfig`
+is what `create_tenant_runner` wires into the agent.
 
 ## Key Concepts
 

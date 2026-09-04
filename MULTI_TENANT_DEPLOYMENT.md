@@ -1,5 +1,17 @@
 # 多租户节点部署拓扑设计
 
+> **文档性质：部署设计蓝图（blueprint）**。本文描述目标生产拓扑与容量规划方法，
+> 其中 Gateway/Worker 分层、Redis Cluster、PostgreSQL HA、Kubernetes 编排等为
+> **设计方案，仓库中不含可直接部署的 gateway/worker 服务与 k8s 清单**。
+> 已实现并测试过的能力见以下文档与代码：
+>
+> - 租户模型/存储/路由/IM：`trpc_agent_sdk/tenants/`（200+ 单测，`tests/tenants/`）
+> - 数据一致性与迁移：`MULTI_TENANT_CONSISTENCY.md`
+> - 故障恢复与运维 SOP：`MULTI_TENANT_OPERATIONS.md`
+> - 容器化冒烟：`examples/multi_tenant_demo/docker-compose.yml`（Redis + demo 节点）
+>
+> 文中代码示例为设计示意，个别 API 签名以 SDK 源码为准。
+
 ## 🏗️ 架构概览
 
 ### 组件拓扑图

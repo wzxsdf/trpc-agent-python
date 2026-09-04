@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+docs
+.claude
+_e2e_env.txt
+examples/skills_code_review_agent

@@ -1,0 +1,29 @@
+# 多租户节点部署冒烟环境。
+#
+# 用法（需 Docker）：
+#   docker compose -f examples/multi_tenant_demo/docker-compose.yml up --build
+#
+# 多节点验证（无 sticky session，两个 demo 副本共享 Redis）：
+#   docker compose -f examples/multi_tenant_demo/docker-compose.yml up --build --scale demo=2
+#
+# 说明：demo 脚本幂等（租户已存在则跳过），两个副本分别输出
+# “✓ 全部 9 项冒烟检查通过”即视为通过。
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  demo:
+    build:
+      context: ../..
+      dockerfile: examples/multi_tenant_demo/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
