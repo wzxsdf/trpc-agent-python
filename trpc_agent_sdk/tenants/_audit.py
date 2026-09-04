@@ -41,6 +41,10 @@ DECISION_IM_REJECTED = "im_message_rejected"
 """IM webhook message rejected (unknown token, bad signature, ...)."""
 DECISION_IM_DUPLICATE = "im_message_duplicate"
 """IM webhook message dropped as a duplicate."""
+DECISION_IM_REPLIED = "im_reply_sent"
+"""IM reply delivered successfully."""
+DECISION_IM_REPLY_FAILED = "im_reply_failed"
+"""IM reply could not be delivered after retries."""
 
 _SECRET_KEY_PATTERNS = ("api_key", "apikey", "secret", "token", "password")
 

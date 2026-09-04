@@ -72,6 +72,13 @@ from ._tenant_channels import (
     MessageDeduplicator,
     TenantChannelManager,
 )
+from ._im_transport import (
+    MessageChunker,
+    RateLimiter,
+    TelegramSender,
+    WeComSender,
+    send_with_retry,
+)
 from ._audit import (
     AuditLog,
     TenantAuditLogger,
@@ -147,6 +154,13 @@ __all__ = [
     "TelegramTenantAdapter",
     "MessageDeduplicator",
     "TenantChannelManager",
+
+    # IM transport
+    "MessageChunker",
+    "RateLimiter",
+    "TelegramSender",
+    "WeComSender",
+    "send_with_retry",
 
     # Audit
     "AuditLog",

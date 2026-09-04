@@ -11,14 +11,25 @@ isolation and message routing.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List, Callable
+from typing import AsyncIterator, Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 
+from trpc_agent_sdk.configs import RunConfig
+from trpc_agent_sdk.events import Event
 from trpc_agent_sdk.log import logger
+from trpc_agent_sdk.types import Content, Part
 
-from ._audit import DECISION_IM_DUPLICATE, DECISION_IM_RECEIVED, DECISION_IM_REJECTED, TenantAuditLogger
+from ._audit import (
+    DECISION_IM_DUPLICATE,
+    DECISION_IM_RECEIVED,
+    DECISION_IM_REJECTED,
+    DECISION_IM_REPLY_FAILED,
+    DECISION_IM_REPLIED,
+    TenantAuditLogger,
+)
+from ._im_transport import (MessageChunker, RateLimiter, TelegramSender, WeComSender, send_with_retry)
 from ._tenant_model import Tenant
 from ._tenant_store import TenantStore
 
@@ -60,13 +71,16 @@ class TenantChannelAdapter(ABC):
     signature verification, and tenant routing.
     """
 
-    def __init__(self, tenant_store: TenantStore):
+    def __init__(self, tenant_store: TenantStore, http_client: Optional[Any] = None):
         """Initialize channel adapter.
 
         Args:
             tenant_store: Tenant storage backend
+            http_client: Optional pre-built ``httpx.AsyncClient`` (tests may
+                inject a ``MockTransport``-backed client)
         """
         self._tenant_store = tenant_store
+        self._http_client = http_client
 
     @abstractmethod
     async def handle_webhook(self, channel_type: str, payload: Dict[str, Any],
@@ -149,7 +163,11 @@ class WeComTenantAdapter(TenantChannelAdapter):
             return None
 
     async def send_response(self, response: TenantResponse) -> bool:
-        """Send response to WeCom."""
+        """Send response to WeCom.
+
+        Credential mapping from ``ChannelConfig``: ``bot_id`` → corp_id,
+        ``api_key`` → corp_secret, ``webhook_token`` → agent_id.
+        """
         try:
             tenant = await self._tenant_store.get_tenant(response.tenant_id)
             if not tenant:
@@ -160,11 +178,17 @@ class WeComTenantAdapter(TenantChannelAdapter):
             if not wecom_config:
                 logger.warning(f"WeCom not configured for tenant {response.tenant_id}")
                 return False
+            if not (wecom_config.bot_id and wecom_config.api_key):
+                logger.warning(f"WeCom credentials incomplete for tenant {response.tenant_id}")
+                return False
 
-            # Implement WeCom API call
-            # This would use the WeCom API to send the message
-            logger.info(f"Sending WeCom response to tenant {response.tenant_id}")
-            return True
+            sender = WeComSender(
+                corp_id=wecom_config.bot_id,
+                corp_secret=wecom_config.api_key,
+                agent_id=wecom_config.webhook_token or "1",
+                http_client=self._http_client,
+            )
+            return await sender.send_text(response.user_id, response.content)
 
         except Exception as e:
             logger.error(f"Error sending WeCom response: {e}")
@@ -305,7 +329,10 @@ class TelegramTenantAdapter(TenantChannelAdapter):
             return None
 
     async def send_response(self, response: TenantResponse) -> bool:
-        """Send response to Telegram."""
+        """Send response to Telegram via the Bot API.
+
+        ``ChannelConfig.api_key`` holds the bot token.
+        """
         try:
             tenant = await self._tenant_store.get_tenant(response.tenant_id)
             if not tenant:
@@ -313,14 +340,29 @@ class TelegramTenantAdapter(TenantChannelAdapter):
                 return False
 
             telegram_config = tenant.get_channel_config("telegram")
-            if not telegram_config:
+            if not telegram_config or not telegram_config.api_key:
                 logger.warning(f"Telegram not configured for tenant {response.tenant_id}")
                 return False
 
-            # Implement Telegram API call
-            # This would use the Telegram Bot API to send the message
-            logger.info(f"Sending Telegram response to tenant {response.tenant_id}")
-            return True
+            sender = TelegramSender(
+                bot_token=telegram_config.api_key,
+                http_client=self._http_client,
+            )
+            if response.message_type == "image":
+                image_url = (response.metadata or {}).get("image_url")
+                if not image_url:
+                    logger.warning("Telegram image response missing metadata.image_url")
+                    return False
+                return await sender.send_image(response.chat_id, image_url, caption=response.content)
+            # text and card messages both go through sendMessage; cards use
+            # Markdown formatting
+            parse_mode = "Markdown" if response.message_type == "card" else None
+            return await sender.send_text(
+                response.chat_id,
+                response.content,
+                reply_to_message_id=response.reply_to_message_id,
+                parse_mode=parse_mode,
+            )
 
         except Exception as e:
             logger.error(f"Error sending Telegram response: {e}")
@@ -517,6 +559,7 @@ class TenantChannelManager:
         """
         self._tenant_store = tenant_store
         self._deduplicator = MessageDeduplicator(redis_url)
+        self._rate_limiter = RateLimiter(redis_url)
         self._audit_logger_factory = audit_logger_factory
 
         # Register channel adapters
@@ -529,7 +572,8 @@ class TenantChannelManager:
                      tenant_id: str,
                      decision: str,
                      message: Optional[TenantMessage],
-                     details: Optional[Dict[str, Any]] = None) -> None:
+                     details: Optional[Dict[str, Any]] = None,
+                     error_type: str = "") -> None:
         """Write an audit entry when an audit logger factory is configured."""
         if self._audit_logger_factory is None:
             return
@@ -538,7 +582,8 @@ class TenantChannelManager:
             decision=decision,
             channel=message.channel_type if message else "unknown",
             user_id=message.user_id if message else "",
-            session_id=message.session_id if message else "",
+            session_id=self.generate_session_id(message) if message else "",
+            error_type=error_type,
             details=details or {},
         )
 
@@ -590,7 +635,93 @@ class TenantChannelManager:
             logger.warning(f"Unsupported channel type: {response.channel_type}")
             return False
 
+        # Rate limit before sending
+        tenant = await self._tenant_store.get_tenant(response.tenant_id)
+        limit = 60
+        if tenant:
+            channel_config = tenant.get_channel_config(response.channel_type)
+            if channel_config:
+                limit = channel_config.rate_limit_per_minute
+        allowed = await self._rate_limiter.acquire(response.tenant_id, response.channel_type, limit)
+        if not allowed:
+            logger.warning(f"Rate limited for tenant {response.tenant_id} on {response.channel_type}")
+            return False
+
         return await adapter.send_response(response)
+
+    async def dispatch_agent_events(self, message: TenantMessage, events: AsyncIterator[Event]) -> List[bool]:
+        """Consume agent events for an IM message and deliver the reply.
+
+        Aggregates final text from the event stream, splits it into
+        platform-size chunks and sends each chunk through
+        :meth:`send_response` with retries. Delivery results are audited.
+
+        Args:
+            message: The incoming IM message being replied to.
+            events: Async iterator of events from ``TenantRunner.run_async``.
+
+        Returns:
+            Per-chunk delivery results (True = delivered).
+        """
+        text_parts: List[str] = []
+        async for event in events:
+            if event.partial:
+                continue
+            event_text = event.get_text()
+            if event_text:
+                text_parts.append(event_text)
+
+        reply_text = "".join(text_parts).strip()
+        if not reply_text:
+            logger.warning(f"Agent produced no reply for message {message.message_id}")
+            return []
+
+        chunks = MessageChunker.split_text(reply_text, MessageChunker.limit_for(message.channel_type))
+        results: List[bool] = []
+        for chunk in chunks:
+            response = TenantResponse(
+                tenant_id=message.tenant_id,
+                channel_type=message.channel_type,
+                user_id=message.user_id,
+                chat_id=message.chat_id,
+                content=chunk,
+                reply_to_message_id=message.message_id,
+            )
+            delivered = await send_with_retry(lambda r=response: self.send_response(r))
+            results.append(delivered)
+            await self._audit(
+                message.tenant_id,
+                DECISION_IM_REPLIED if delivered else DECISION_IM_REPLY_FAILED,
+                message,
+                {} if delivered else {"chunk": chunk[:100]},
+                error_type="" if delivered else "IMDeliveryError",
+            )
+        return results
+
+    async def run_and_reply(self, runner, message: TenantMessage, run_config: Optional[Any] = None) -> List[bool]:
+        """Run the tenant agent for an IM message and deliver its reply.
+
+        This is the full inbound loop: IM message → agent execution →
+        agent events → IM reply (chunked, rate-limited, audited).
+
+        Args:
+            runner: A :class:`~trpc_agent_sdk.tenants.TenantRunner` (or any
+                object exposing ``run_async`` with keyword-only args).
+            message: The incoming IM message.
+            run_config: Optional run configuration.
+
+        Returns:
+            Per-chunk delivery results (True = delivered).
+        """
+        session_id = self.generate_session_id(message)
+        new_message = Content(parts=[Part.from_text(text=message.content)])
+        events = runner.run_async(
+            user_id=message.user_id,
+            session_id=session_id,
+            new_message=new_message,
+            run_config=run_config or RunConfig(),
+        )
+        return await self.dispatch_agent_events(message, events)
 
     def generate_session_id(self, message: TenantMessage) -> str:
         """Generate session ID using appropriate adapter.
