@@ -291,7 +291,9 @@ class StorageRouter:
         if not backend_key:
             raise ValueError(f"Unsupported data category: {category}")
 
-        backend_type_str = tenant_config.get(backend_key, "in_memory")
+        default_backend = ("in_memory" if backend_key != "artifact_backend" else tenant_config.get(
+            "session_backend", "in_memory"))
+        backend_type_str = tenant_config.get(backend_key, default_backend)
         try:
             backend_type = StorageBackendType(backend_type_str)
         except ValueError:
@@ -564,26 +566,13 @@ class RedisStorageBackend(UnifiedStorageBackend):
         if not data:
             return None
 
-        # Deserialize session (simplified, use proper serialization in production)
-        import json
-        session_data = json.loads(data)
-        return Session(**session_data)
+        return Session(**json.loads(data))
 
     async def save_session(self, tenant_id: str, session: Session) -> None:
         redis_client = await self._get_redis()
         key = self._session_key(tenant_id, session.id)
 
-        # Serialize session (simplified, use proper serialization in production)
-        import json
-        session_data = {
-            "id": session.id,
-            "app_name": session.app_name,
-            "user_id": session.user_id,
-            "metadata": session.metadata,
-            "created_at": session.created_at.isoformat() if session.created_at else None,
-        }
-
-        await redis_client.set(key, json.dumps(session_data))
+        await redis_client.set(key, json.dumps(session.model_dump(), ensure_ascii=False))
 
     async def add_session_event(self, tenant_id: str, session_id: str, event: Event) -> None:
         redis_client = await self._get_redis()
@@ -964,7 +953,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
                 tenant_id = Column(String(64), nullable=False, index=True)
                 app_name = Column(String(256))
                 user_id = Column(String(256))
-                metadata_json = Column(Text)
+                payload_json = Column(Text)  # full Session model_dump JSON
                 created_at = Column(DateTime)
 
             class EventRecord(Base):
@@ -1005,24 +994,17 @@ class SQLStorageBackend(UnifiedStorageBackend):
         try:
             from sqlalchemy import text
 
-            result = await session.execute(text("SELECT * FROM sessions WHERE id = :sid AND tenant_id = :tid"), {
-                "sid": session_id,
-                "tid": tenant_id
-            })
+            result = await session.execute(
+                text("SELECT payload_json FROM sessions WHERE id = :sid AND tenant_id = :tid"), {
+                    "sid": session_id,
+                    "tid": tenant_id
+                })
             row = result.fetchone()
 
-            if not row:
+            if not row or not row.payload_json:
                 return None
 
-            # Parse and return Session object
-            import json
-            return Session(
-                id=row.id,
-                app_name=row.app_name,
-                user_id=row.user_id,
-                metadata=json.loads(row.metadata_json) if row.metadata_json else {},
-                created_at=row.created_at,
-            )
+            return Session(**json.loads(row.payload_json))
         finally:
             await session.close()
 
@@ -1030,20 +1012,20 @@ class SQLStorageBackend(UnifiedStorageBackend):
         session_db = await self._get_session()
 
         try:
-            import json
+            from datetime import datetime
             from sqlalchemy import text
 
             await session_db.execute(
                 text("""
-                    INSERT OR REPLACE INTO sessions (id, tenant_id, app_name, user_id, metadata_json, created_at)
-                    VALUES (:id, :tid, :app_name, :user_id, :metadata, :created_at)
+                    INSERT OR REPLACE INTO sessions (id, tenant_id, app_name, user_id, payload_json, created_at)
+                    VALUES (:id, :tid, :app_name, :user_id, :payload, :created_at)
                 """), {
                     "id": session.id,
                     "tid": tenant_id,
                     "app_name": session.app_name,
                     "user_id": session.user_id,
-                    "metadata": json.dumps(session.metadata),
-                    "created_at": session.created_at,
+                    "payload": json.dumps(session.model_dump(), ensure_ascii=False),
+                    "created_at": datetime.utcnow(),
                 })
             await session_db.commit()
         except Exception:

@@ -82,6 +82,10 @@ class StorageConfig:
     memory_backend: str = "redis"  # 'in_memory', 'redis', 'sql', 'mem0'
     knowledge_backend: str = "langchain_vectorstore"  # 'langchain_vectorstore', 'external'
     audit_backend: str = "sql"  # 'sql', 'external'
+    # Binary artifact storage ('in_memory', 'redis', 'sql', 'file_system');
+    # S3/OSS/MinIO via StorageRouter.register_backend_factory. Summaries ride
+    # on session_backend (same consistency domain).
+    artifact_backend: str = "redis"
 
     # Backend-specific settings
     redis_url: Optional[str] = None

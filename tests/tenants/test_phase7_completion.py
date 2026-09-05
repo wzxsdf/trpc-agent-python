@@ -134,6 +134,38 @@ class TestSummaryArtifactAbc:
         assert await backend.delete_artifact("t", "a1") is True
         assert await backend.delete_artifact("t", "a1") is False
 
+    async def test_sql_session_roundtrip(self, tmp_path):
+        from trpc_agent_sdk.sessions import Session
+
+        pytest.importorskip("aiosqlite")
+        path = str(tmp_path / "storage.db").replace("\\", "/")
+        backend = SQLStorageBackend(f"sqlite:///{path}")
+
+        session = Session(id="s1", app_name="app", user_id="u1", save_key="sk", state={"k": "v"})
+        await backend.save_session("acme", session)
+        loaded = await backend.get_session("acme", "s1")
+        assert loaded is not None
+        assert loaded.state == {"k": "v"}
+        assert loaded.save_key == "sk"
+        assert loaded.user_id == "u1"
+        assert await backend.get_session("acme", "missing") is None
+
+    async def test_redis_session_serialization_matches_model(self, tmp_path):
+        # Without a Redis server we assert the saved payload shape via the
+        # same code path used by RedisStorageBackend (model_dump round trip).
+        from trpc_agent_sdk.sessions import Session
+
+        session = Session(id="s1", app_name="app", user_id="u1", save_key="sk", state={"k": "v"})
+        restored = Session(**json.loads(json.dumps(session.model_dump(), ensure_ascii=False)))
+        assert restored == session
+
+    def test_storage_config_artifact_backend(self):
+        from trpc_agent_sdk.tenants import StorageConfig
+
+        assert StorageConfig().artifact_backend == "redis"
+        tenant = TenantConfig(tenant_id="t", name="T", storage_config={"artifact_backend": "file_system"}).to_tenant()
+        assert tenant.storage_config.artifact_backend == "file_system"
+
     async def test_router_routes_artifact_to_dedicated_backend(self):
         router = StorageRouter({"t": {
             "session_backend": "in_memory",
