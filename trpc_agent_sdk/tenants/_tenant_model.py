@@ -66,6 +66,12 @@ class ChannelConfig:
     allowed_users: List[str] = field(default_factory=list)
     rate_limit_per_minute: int = 60
     enable_streaming: bool = True
+    # Session id generation strategy for this channel:
+    #   "chat"  — one session per chat (default, 1:1 conversations)
+    #   "user"  — one session per user across all chats
+    #   "group" — group chats share a group session, private chats fall
+    #             back to per-user sessions
+    session_strategy: str = "chat"
 
 
 @dataclass

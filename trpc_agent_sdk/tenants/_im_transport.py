@@ -349,3 +349,38 @@ class WeComSender:
             logger.warning(f"WeCom message/send failed: {data}")
             return False
         return True
+
+    async def send_markdown(self, user_id: str, markdown: str) -> bool:
+        """Send a markdown app-message via ``message/send``.
+
+        WeCom markdown supports a subset of Markdown syntax (bold, links,
+        quotes, code, line breaks); complex tables/images are not rendered
+        client-side. Card-style responses should be composed accordingly.
+
+        Args:
+            user_id: Target WeCom user id (``touser``).
+            markdown: Markdown-formatted message body.
+
+        Returns:
+            True on success.
+        """
+        token = await self._get_access_token()
+        if not token:
+            return False
+        client = await self._client()
+        payload = {
+            "touser": user_id,
+            "msgtype": "markdown",
+            "agentid": self._agent_id,
+            "markdown": {
+                "content": markdown
+            },
+        }
+        response = await client.post(f"{self._base_url}/cgi-bin/message/send",
+                                     params={"access_token": token},
+                                     json=payload)
+        data = response.json()
+        if data.get("errcode") != 0:
+            logger.warning(f"WeCom markdown send failed: {data}")
+            return False
+        return True

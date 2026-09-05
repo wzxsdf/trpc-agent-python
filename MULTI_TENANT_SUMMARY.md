@@ -1,7 +1,7 @@
 # 多租户架构实施完成总结
 
 > **诚实声明**：本总结区分「已实现并测试」与「设计蓝图」。已实现部分以
-> `trpc_agent_sdk/tenants/` 源码和 `tests/tenants/`（166 个单测，另有需真实
+> `trpc_agent_sdk/tenants/` 源码和 `tests/tenants/`（205 个单测，另有需真实
 > LLM 的 opt-in e2e）为准；未实现的（如 K8s 清单、监控面板）标注为设计目标。
 
 ## 🎉 项目完成概览
@@ -268,7 +268,7 @@ Prometheus 文本格式     # 零依赖自实现（未使用 prometheus-client�
 
 ### 代码实现
 - **核心模块**: `trpc_agent_sdk/tenants/` 20+ 个模块，覆盖租户全生命周期
-- **测试覆盖**: `tests/tenants/` 166 个单测通过（另有需真实 LLM API 的 opt-in e2e 测试，
+- **测试覆盖**: `tests/tenants/` 205 个单测通过（另有需真实 LLM API 的 opt-in e2e 测试，
   因演示 API 网关不可达未跑通，与功能代码无关）
 - **冒烟验证**: `examples/multi_tenant_demo/full_stack_demo.py` 9 项断言式检查
   （存储/路由/IM/Runner 接线/熔断/降级/灰度/容量/指标），容器化入口见同目录 compose
@@ -317,7 +317,7 @@ Prometheus 文本格式     # 零依赖自实现（未使用 prometheus-client�
 这个多租户架构项目为 trpc-agent-python 实现了 AI Agent 多租户系统的核心能力：
 
 1. **完整性**: 从数据模型到存储一致性、治理监控、故障恢复的全链路实现
-2. **有测试保障**: 166 个单测 + 9 项容器化冒烟检查
+2. **有测试保障**: 205 个单测 + 9 项容器化冒烟检查
 3. **可扩展性**: 无 sticky session 设计，共享存储后可水平扩展
 4. **边界清晰**: 未实现部分（K8s 清单、监控面板、压测数据）已明确标注为设计目标
 

@@ -114,7 +114,43 @@ python -m trpc_agent_sdk.tenants._sql_migrations mysql+pymysql://user:pwd@host:3
 文本匹配；`VectorBackend` 面向 embedding 语义检索。两者按
 `StorageConfig` / `DataCategory` 路由，可独立选型。
 
-## 6. 测试覆盖
+## 6. 后端间数据迁移
+
+`_tenant_data_migration.py` 提供跨后端迁移工具，覆盖两类数据：
+
+**租户配置迁移** `migrate_tenants(source, target, page_size=100, overwrite=False)`：
+
+- 按 `list_tenants` 分页遍历源存储，逐个 `tenant_exists` 幂等判断后写入目标
+  （已存在默认跳过，`overwrite=True` 时删除重建）；
+- 单个租户失败只记录进 `MigrationReport.errors`，不中断批次——崩溃后可直接重跑。
+
+**向量数据迁移** `migrate_vectors(source, target, tenant_ids, batch_size=500)`：
+
+- `VectorBackend` 新增 `list_records(tenant_id)`（基类默认抛
+  `NotImplementedError`，后端必须显式实现才可参与迁移，避免"静默空结果"
+  被误判为空库）；按租户拉全量记录，原 id 分批 `upsert` 到目标，天然幂等；
+- 迁移后逐租户回读 `count` 比对，数量不一致计入失败。
+
+**切换前回读校验** `verify_tenant_migration(source, target, tenant_ids=None)`：
+对每个租户双读比对 `name` / `config_version` / `tool_permissions`，
+`report.ok` 为 True 才允许切换流量。
+
+**四阶段切换流程**（与灰度发布 `_tenant_rollout.py` 配合）：
+
+```
+1. 双写期   写路径同时写 source 与 target（应用层或网关侧实现）
+2. 追平期   跑 migrate_tenants + migrate_vectors（幂等，可多次重跑）
+3. 校验期   verify_tenant_migration 全部通过 → report.ok == True
+4. 切换期   灰度发布把读流量逐步切到 target（5% → 25% → 50% → 100%）；
+            出问题 rollback 秒级回切 source
+```
+
+**一致性取舍声明**：迁移工具是批量离线工具，不做双写编排本身；双写期
+source/target 之间存在短暂窗口不一致，最终以第 3 步回读校验 + 第 4 步灰度
+观察为准。向量迁移按 `count` 回读校验，不逐条比对 embedding（浮点序列化
+差异会导致假阳性）。
+
+## 7. 测试覆盖
 
 `tests/tenants/test_storage_sql.py`（21 用例）：
 

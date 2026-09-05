@@ -65,6 +65,15 @@ class VectorBackend(ABC):
     def count(self, tenant_id: str) -> int:
         """Return the number of records stored for a tenant."""
 
+    def list_records(self, tenant_id: str, limit: Optional[int] = None) -> List[VectorRecord]:
+        """Return stored records for a tenant (used by migration tooling).
+
+        Concrete backends that support migration must override this; the base
+        implementation raises so a backend that silently returns nothing is
+        impossible to mistake for an empty store.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support list_records")
+
 
 def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity between two vectors (0.0 when either is zero)."""
@@ -146,3 +155,18 @@ class InMemoryVectorBackend(VectorBackend):
         """Return the number of records for a tenant."""
         with self._lock:
             return len(self._store.get(tenant_id, {}))
+
+    def list_records(self, tenant_id: str, limit: Optional[int] = None) -> List[VectorRecord]:
+        """Return copies of all records for a tenant (insertion order)."""
+        with self._lock:
+            records = list(self._store.get(tenant_id, {}).values())
+        if limit is not None and limit >= 0:
+            records = records[:limit]
+        return [
+            VectorRecord(
+                embedding=list(r.embedding),
+                text=r.text,
+                metadata=dict(r.metadata),
+                id=r.id,
+            ) for r in records
+        ]

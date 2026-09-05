@@ -11,6 +11,9 @@ deployment numbers:
 
 - :func:`nodes_for_qps` — horizontal node count for a target QPS given the
   per-node capacity and a headroom margin (N+1 style redundancy).
+- :func:`nodes_for_sessions` — node count by the concurrent-session dimension
+  (long-lived streaming/IM sessions); :func:`capacity_plan` sizes nodes at
+  ``max(qps_nodes, session_nodes)``.
 - :func:`project_month_end_usage` — linear month-to-date extrapolation of
   token / cost usage to month end.
 - :func:`budget_headroom` — remaining monthly budget per tenant after
@@ -46,6 +49,32 @@ def nodes_for_qps(target_qps: float, per_node_qps: float, headroom_percent: floa
     if headroom_percent < 0:
         raise ValueError("headroom_percent must be >= 0")
     needed = target_qps / per_node_qps * (1 + headroom_percent / 100)
+    return max(1, math.ceil(needed))
+
+
+def nodes_for_sessions(target_sessions: float, per_node_sessions: float, headroom_percent: float = 30.0) -> int:
+    """Return the node count needed to hold ``target_sessions`` concurrent.
+
+    Complements :func:`nodes_for_qps`: long-lived streaming/IM sessions can
+    exhaust memory/connections before QPS does, so node sizing is
+    ``max(qps_nodes, session_nodes)``.
+
+    Args:
+        target_sessions: Peak concurrent sessions the cluster must hold.
+        per_node_sessions: Concurrent sessions one node sustains
+            (matches ``AppConfig.max_concurrent_sessions`` sizing).
+        headroom_percent: Safety margin (default 30%).
+
+    Returns:
+        Node count (at least 1; rounds up).
+    """
+    if target_sessions < 0:
+        raise ValueError("target_sessions must be >= 0")
+    if per_node_sessions <= 0:
+        raise ValueError("per_node_sessions must be > 0")
+    if headroom_percent < 0:
+        raise ValueError("headroom_percent must be >= 0")
+    needed = target_sessions / per_node_sessions * (1 + headroom_percent / 100)
     return max(1, math.ceil(needed))
 
 
@@ -99,6 +128,12 @@ class CapacityReport:
     headroom_percent: float
     nodes_required: int
     tenants: List[TenantCapacityRow] = field(default_factory=list)
+    peak_concurrent_sessions: float = 0.0
+    """Observed peak concurrent sessions (0 = dimension not evaluated)."""
+    per_node_sessions: float = 0.0
+    """Concurrent session capacity of one node (0 = not evaluated)."""
+    session_nodes_required: int = 0
+    """Nodes needed by the session dimension (0 = not evaluated)."""
 
     def tenants_over_budget(self) -> List[str]:
         """Tenant ids projected to exceed their monthly budget."""
@@ -112,6 +147,9 @@ class CapacityReport:
             "per_node_qps": self.per_node_qps,
             "headroom_percent": self.headroom_percent,
             "nodes_required": self.nodes_required,
+            "peak_concurrent_sessions": self.peak_concurrent_sessions,
+            "per_node_sessions": self.per_node_sessions,
+            "session_nodes_required": self.session_nodes_required,
             "tenant_count": len(self.tenants),
             "tenants_over_budget": self.tenants_over_budget(),
         }
@@ -123,6 +161,8 @@ def capacity_plan(
     tenant_usage: List[Dict[str, float]],
     headroom_percent: float = 30.0,
     today: Optional[date] = None,
+    concurrent_sessions: float = 0.0,
+    per_node_sessions: float = 0.0,
 ) -> CapacityReport:
     """Build a one-shot capacity report.
 
@@ -134,10 +174,14 @@ def capacity_plan(
             ``monthly_budget_usd``.
         headroom_percent: Node headroom margin.
         today: Reference date (defaults to today).
+        concurrent_sessions: Observed peak concurrent sessions; when > 0 the
+            session dimension participates in node sizing.
+        per_node_sessions: Concurrent sessions one node sustains
+            (required when ``concurrent_sessions`` > 0).
 
     Returns:
-        :class:`CapacityReport` with node sizing and per-tenant budget
-        projections.
+        :class:`CapacityReport` with node sizing (max of the QPS and session
+        dimensions) and per-tenant budget projections.
     """
     today = today or date.today()
     rows: List[TenantCapacityRow] = []
@@ -157,13 +201,20 @@ def capacity_plan(
                 monthly_budget_usd=budget,
                 budget_headroom_usd=budget - projected_cost,
             ))
+    qps_nodes = nodes_for_qps(peak_qps, per_node_qps, headroom_percent)
+    session_nodes = 0
+    if concurrent_sessions > 0:
+        session_nodes = nodes_for_sessions(concurrent_sessions, per_node_sessions, headroom_percent)
     return CapacityReport(
         generated_on=today,
         peak_qps=peak_qps,
         per_node_qps=per_node_qps,
         headroom_percent=headroom_percent,
-        nodes_required=nodes_for_qps(peak_qps, per_node_qps, headroom_percent),
+        nodes_required=max(qps_nodes, session_nodes),
         tenants=rows,
+        peak_concurrent_sessions=concurrent_sessions,
+        per_node_sessions=per_node_sessions,
+        session_nodes_required=session_nodes,
     )
 
 

@@ -123,6 +123,27 @@ class TenantChannelAdapter(ABC):
         pass
 
 
+def _resolve_session_strategy(tenant: Optional[Tenant], channel_type: str) -> str:
+    """Return the configured session strategy for a channel ("chat"/"user"/"group")."""
+    config = tenant.get_channel_config(channel_type) if tenant else None
+    strategy = getattr(config, "session_strategy", None) or "chat"
+    return strategy if strategy in ("chat", "user", "group") else "chat"
+
+
+def _strategy_session_id(message: TenantMessage, channel_type: str) -> str:
+    """Build a session id honoring the tenant's session_strategy.
+
+    Extractors store the resolved strategy in ``message.metadata`` so this
+    stays synchronous (tenant lookup happens during webhook handling).
+    """
+    strategy = message.metadata.get("session_strategy", "chat")
+    if strategy == "user":
+        return f"{message.tenant_id}:{channel_type}:user:{message.user_id}"
+    if strategy == "group" and message.is_group_chat:
+        return f"{message.tenant_id}:{channel_type}:group:{message.chat_id}"
+    return f"{message.tenant_id}:{channel_type}:chat:{message.chat_id}"
+
+
 class WeComTenantAdapter(TenantChannelAdapter):
     """WeCom (企业微信) tenant-aware adapter.
 
@@ -189,6 +210,9 @@ class WeComTenantAdapter(TenantChannelAdapter):
                 agent_id=wecom_config.webhook_token or "1",
                 http_client=self._http_client,
             )
+            if response.message_type == "card":
+                # Card responses are rendered as WeCom markdown messages.
+                return await sender.send_markdown(response.user_id, response.content)
             return await sender.send_text(response.user_id, response.content)
 
         except Exception as e:
@@ -198,24 +222,10 @@ class WeComTenantAdapter(TenantChannelAdapter):
     def generate_session_id(self, message: TenantMessage) -> str:
         """Generate session ID for WeCom message.
 
-        Strategy options:
-        1. User-level: Each user has one session across all chats
-        2. Chat-level: Each chat has its own session
-        3. Group-level: Group chats share sessions
+        Honors the tenant's ``ChannelConfig.session_strategy``
+        ("chat" / "user" / "group"); defaults to chat-level sessions.
         """
-        tenant = message.tenant_id
-
-        # Strategy 1: User-level session
-        # return f"{tenant}:wecom:user:{message.user_id}"
-
-        # Strategy 2: Chat-level session (recommended for most cases)
-        return f"{tenant}:wecom:chat:{message.chat_id}"
-
-        # Strategy 3: Group-level sessions (for group chats)
-        # if message.is_group_chat:
-        #     return f"{tenant}:wecom:group:{message.chat_id}"
-        # else:
-        #     return f"{tenant}:wecom:user:{message.user_id}"
+        return _strategy_session_id(message, "wecom")
 
     async def _find_tenant_by_wecom_token(self, token: str) -> Optional[Tenant]:
         """Find tenant by WeCom webhook token."""
@@ -286,6 +296,7 @@ class WeComTenantAdapter(TenantChannelAdapter):
                 "from_user_name": from_user,
                 "to_user_name": to_user,
                 "agent_id": payload.get("agent_id", ""),
+                "session_strategy": _resolve_session_strategy(tenant, "wecom"),
             },
             timestamp=datetime.utcnow(),
             is_group_chat=is_group_chat,
@@ -372,12 +383,10 @@ class TelegramTenantAdapter(TenantChannelAdapter):
     def generate_session_id(self, message: TenantMessage) -> str:
         """Generate session ID for Telegram message.
 
-        For Telegram, we typically use chat-level sessions.
+        Honors the tenant's ``ChannelConfig.session_strategy``
+        ("chat" / "user" / "group"); defaults to chat-level sessions.
         """
-        tenant = message.tenant_id
-
-        # Use chat ID for session
-        return f"{tenant}:telegram:chat:{message.chat_id}"
+        return _strategy_session_id(message, "telegram")
 
     async def _find_tenant_by_telegram_token(self, bot_token: str) -> Optional[Tenant]:
         """Find tenant by Telegram bot token."""
@@ -423,6 +432,7 @@ class TelegramTenantAdapter(TenantChannelAdapter):
                 "from_username": from_user.get("username", ""),
                 "from_first_name": from_user.get("first_name", ""),
                 "chat_title": chat.get("title", ""),
+                "session_strategy": _resolve_session_strategy(tenant, "telegram"),
             },
             timestamp=datetime.utcnow(),
             is_group_chat=is_group_chat,

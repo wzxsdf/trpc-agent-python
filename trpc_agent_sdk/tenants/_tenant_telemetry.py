@@ -34,6 +34,8 @@ from opentelemetry import context as otel_context
 from opentelemetry import propagate
 from opentelemetry import trace
 
+from trpc_agent_sdk.log import logger
+
 TRACER = trace.get_tracer("trpc.python.tenants")
 
 _RUN_LATENCY_BUCKETS = [10, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
@@ -286,3 +288,61 @@ class TenantTelemetryHooks:
                 "tool": tool_name
             }, latency_ms)
         return None
+
+
+_otel_export_configured = False
+
+
+def configure_otel_http_exporter(endpoint: str,
+                                 service_name: str = "trpc-agent-tenants",
+                                 interval_millis: int = 5000) -> bool:
+    """Export SDK spans to an OpenTelemetry Collector via OTLP/HTTP.
+
+    Wires a ``TracerProvider`` with an ``OTLPSpanExporter`` (HTTP protobuf,
+    ``opentelemetry-exporter-otlp-proto-http`` — already a core SDK
+    dependency) and a ``BatchSpanProcessor``. Every node in the deployment
+    calls this at startup with the same Collector endpoint; the Collector
+    then fans out to Jaeger/Tempo/vendor backends.
+
+    Safe to call repeatedly:
+
+    - If a real (non-proxy) tracer provider is already configured, this is a
+      no-op and returns ``False`` — an existing provider is never clobbered.
+    - If the exporter package is missing, warns and returns ``False``.
+
+    Args:
+        endpoint: Collector OTLP/HTTP endpoint
+            (e.g. ``http://otel-collector:4318/v1/traces``).
+        service_name: ``service.name`` resource attribute.
+        interval_millis: Batch span processor schedule delay.
+
+    Returns:
+        True when the exporter was installed by this call.
+    """
+    global _otel_export_configured
+    if _otel_export_configured:
+        return False
+
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError:
+        logger.warning("OTLP HTTP exporter not installed; spans stay local "
+                       "(pip install opentelemetry-exporter-otlp-proto-http)")
+        return False
+
+    current_provider = trace.get_tracer_provider()
+    if getattr(current_provider, "add_span_processor", None) is not None:
+        # A real SDK provider (or vendor provider) is already installed.
+        logger.info("OTel tracer provider already configured; skipping exporter setup")
+        return False
+
+    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint), schedule_delay_millis=interval_millis))
+    trace.set_tracer_provider(provider)
+    _otel_export_configured = True
+    logger.info(f"OTLP/HTTP span export enabled -> {endpoint} (service={service_name})")
+    return True

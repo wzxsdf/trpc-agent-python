@@ -64,6 +64,7 @@ from ._unified_storage import (
     InMemoryStorageBackend,
     RedisStorageBackend,
     SQLStorageBackend,
+    FileSystemStorageBackend,
 )
 from ._tenant_channels import (
     TenantChannelAdapter,
@@ -97,6 +98,7 @@ from ._tenant_governance import (
 from ._tenant_telemetry import (
     TenantMetrics,
     TenantTelemetryHooks,
+    configure_otel_http_exporter,
     current_trace_id,
     extract_trace_headers,
     get_tenant_metrics,
@@ -108,6 +110,12 @@ from ._tenant_vector import (
     InMemoryVectorBackend,
     VectorBackend,
     VectorRecord,
+)
+from ._tenant_data_migration import (
+    MigrationReport,
+    migrate_tenants,
+    migrate_vectors,
+    verify_tenant_migration,
 )
 from ._sql_ddl import (
     TENANT_TABLE_NAMES,
@@ -142,7 +150,12 @@ from ._tenant_capacity import (
     budget_headroom,
     capacity_plan,
     nodes_for_qps,
+    nodes_for_sessions,
     project_month_end_usage,
+)
+from ._tenant_admin_api import (
+    TenantAdminService,
+    create_admin_app,
 )
 
 __all__ = [
@@ -198,6 +211,7 @@ __all__ = [
     "InMemoryStorageBackend",
     "RedisStorageBackend",
     "SQLStorageBackend",
+    "FileSystemStorageBackend",
 
     # IM channels
     "TenantChannelAdapter",
@@ -231,6 +245,7 @@ __all__ = [
     # Telemetry (tracing + metrics)
     "TenantMetrics",
     "TenantTelemetryHooks",
+    "configure_otel_http_exporter",
     "current_trace_id",
     "extract_trace_headers",
     "get_tenant_metrics",
@@ -244,6 +259,16 @@ __all__ = [
     "VectorBackend",
     "VectorRecord",
     "InMemoryVectorBackend",
+
+    # Cross-backend data migration
+    "MigrationReport",
+    "migrate_tenants",
+    "migrate_vectors",
+    "verify_tenant_migration",
+
+    # Admin API (control plane)
+    "TenantAdminService",
+    "create_admin_app",
 
     # SQL schema (DDL + migrations)
     "TENANT_TABLE_NAMES",
@@ -277,5 +302,6 @@ __all__ = [
     "budget_headroom",
     "capacity_plan",
     "nodes_for_qps",
+    "nodes_for_sessions",
     "project_month_end_usage",
 ]

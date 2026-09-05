@@ -13,6 +13,11 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 from enum import Enum
 import asyncio
+import base64
+import functools
+import json
+import os
+import uuid
 
 from trpc_agent_sdk.sessions import Session
 from trpc_agent_sdk.events import Event
@@ -25,6 +30,7 @@ class StorageBackendType(Enum):
     IN_MEMORY = "in_memory"
     REDIS = "redis"
     SQL = "sql"
+    FILE_SYSTEM = "file_system"
     MEM0 = "mem0"
     MEMPALACE = "mempalace"
     LANGCHAIN_VECTORSTORE = "langchain_vectorstore"
@@ -141,6 +147,56 @@ class UnifiedStorageBackend(ABC):
         """
         pass
 
+    # ---- Summary & Artifact storage -------------------------------------
+    # Concrete backends override these; the base implementations raise so a
+    # backend that silently drops data is impossible to mistake for one that
+    # stores it.
+
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        """Persist the rolling summary of a session.
+
+        Args:
+            tenant_id: Tenant identifier.
+            session_id: Session the summary belongs to.
+            summary: Summary text (latest version replaces the previous one).
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support summary storage")
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        """Return the stored summary for a session (None when absent)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support summary storage")
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Store an opaque binary artifact for a tenant.
+
+        Args:
+            tenant_id: Tenant identifier.
+            artifact_id: Caller-provided unique id within the tenant.
+            data: Raw bytes.
+            metadata: Optional JSON-able descriptor (filename, mime, ...).
+
+        Returns:
+            Descriptor dict with at least ``artifact_id``, ``tenant_id`` and
+            ``size``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support artifact storage")
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        """Load an artifact.
+
+        Returns:
+            Dict with ``data`` (bytes) and ``metadata``, or None when absent.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support artifact storage")
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        """Delete an artifact; returns True when it existed."""
+        raise NotImplementedError(f"{type(self).__name__} does not support artifact storage")
+
 
 class StorageRouter:
     """Router that directs data operations to appropriate backends.
@@ -187,6 +243,10 @@ class StorageRouter:
         self._backend_factories[StorageBackendType.SQL] = (
             lambda config: SQLStorageBackend(config.get("sql_url", "sqlite:///./storage.db")))
 
+        # File system backend (local object storage)
+        self._backend_factories[StorageBackendType.FILE_SYSTEM] = (
+            lambda config: FileSystemStorageBackend(config.get("storage_root", "./tenant_storage")))
+
     def register_backend_factory(self, backend_type: StorageBackendType, factory: callable):
         """Register a custom backend factory.
 
@@ -215,12 +275,16 @@ class StorageRouter:
 
         tenant_config = self._tenant_configs[tenant_id]
 
-        # Map data category to backend type
+        # Map data category to backend type. Summaries follow the session
+        # backend (same consistency domain); artifacts default to a dedicated
+        # "artifact_backend" key and fall back to the session backend.
         category_to_backend_key = {
             DataCategory.SESSION: "session_backend",
             DataCategory.MEMORY: "memory_backend",
             DataCategory.KNOWLEDGE: "knowledge_backend",
             DataCategory.AUDIT_LOG: "audit_backend",
+            DataCategory.SUMMARY: "session_backend",
+            DataCategory.ARTIFACT: "artifact_backend",
         }
 
         backend_key = category_to_backend_key.get(category)
@@ -284,6 +348,35 @@ class StorageRouter:
         backend = self.get_backend(tenant_id, DataCategory.AUDIT_LOG)
         await backend.save_audit_log(tenant_id, audit_data)
 
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        """Save session summary using appropriate backend."""
+        backend = self.get_backend(tenant_id, DataCategory.SUMMARY)
+        await backend.save_summary(tenant_id, session_id, summary)
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        """Load session summary using appropriate backend."""
+        backend = self.get_backend(tenant_id, DataCategory.SUMMARY)
+        return await backend.get_summary(tenant_id, session_id)
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Store an artifact using appropriate backend."""
+        backend = self.get_backend(tenant_id, DataCategory.ARTIFACT)
+        return await backend.save_artifact(tenant_id, artifact_id, data, metadata)
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        """Load an artifact using appropriate backend."""
+        backend = self.get_backend(tenant_id, DataCategory.ARTIFACT)
+        return await backend.get_artifact(tenant_id, artifact_id)
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        """Delete an artifact using appropriate backend."""
+        backend = self.get_backend(tenant_id, DataCategory.ARTIFACT)
+        return await backend.delete_artifact(tenant_id, artifact_id)
+
     async def health_check(self, tenant_id: Optional[str] = None) -> Dict[str, bool]:
         """Check health of storage backends.
 
@@ -328,6 +421,8 @@ class InMemoryStorageBackend(UnifiedStorageBackend):
         self._memories: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
         self._knowledge: Dict[str, List[Dict[str, Any]]] = {}
         self._audit_logs: Dict[str, List[Dict[str, Any]]] = {}
+        self._summaries: Dict[str, Dict[str, str]] = {}
+        self._artifacts: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     def _tenant_session_key(self, tenant_id: str) -> str:
         return tenant_id
@@ -384,6 +479,39 @@ class InMemoryStorageBackend(UnifiedStorageBackend):
 
     async def health_check(self) -> bool:
         return True
+
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        self._summaries.setdefault(tenant_id, {})[session_id] = summary
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        return self._summaries.get(tenant_id, {}).get(session_id)
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        descriptor = {
+            "artifact_id": artifact_id,
+            "tenant_id": tenant_id,
+            "size": len(data),
+            "metadata": dict(metadata or {}),
+        }
+        self._artifacts.setdefault(tenant_id, {})[artifact_id] = {"data": data, "descriptor": descriptor}
+        return descriptor
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        record = self._artifacts.get(tenant_id, {}).get(artifact_id)
+        if record is None:
+            return None
+        return {"data": record["data"], "metadata": record["descriptor"]["metadata"]}
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        tenant_artifacts = self._artifacts.get(tenant_id, {})
+        if artifact_id in tenant_artifacts:
+            del tenant_artifacts[artifact_id]
+            return True
+        return False
 
 
 class RedisStorageBackend(UnifiedStorageBackend):
@@ -521,6 +649,50 @@ class RedisStorageBackend(UnifiedStorageBackend):
         import json
         await redis_client.set(key, json.dumps(audit_data))
 
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        redis_client = await self._get_redis()
+        key = f"{self._tenant_prefix(tenant_id)}:summary:{session_id}"
+        await redis_client.set(key, summary)
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        redis_client = await self._get_redis()
+        key = f"{self._tenant_prefix(tenant_id)}:summary:{session_id}"
+        return await redis_client.get(key)
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        redis_client = await self._get_redis()
+        key = f"{self._tenant_prefix(tenant_id)}:artifact:{artifact_id}"
+        descriptor = {
+            "artifact_id": artifact_id,
+            "tenant_id": tenant_id,
+            "size": len(data),
+            "metadata": dict(metadata or {}),
+        }
+        payload = {"descriptor": descriptor, "data_base64": base64.b64encode(data).decode("ascii")}
+        await redis_client.set(key, json.dumps(payload))
+        return descriptor
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        redis_client = await self._get_redis()
+        key = f"{self._tenant_prefix(tenant_id)}:artifact:{artifact_id}"
+        raw = await redis_client.get(key)
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        return {
+            "data": base64.b64decode(payload["data_base64"]),
+            "metadata": payload["descriptor"]["metadata"],
+        }
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        redis_client = await self._get_redis()
+        key = f"{self._tenant_prefix(tenant_id)}:artifact:{artifact_id}"
+        return bool(await redis_client.delete(key))
+
     async def health_check(self) -> bool:
         try:
             redis_client = await self._get_redis()
@@ -528,6 +700,218 @@ class RedisStorageBackend(UnifiedStorageBackend):
             return True
         except Exception as e:
             logger.error(f"Redis health check failed: {e}")
+            return False
+
+
+class FileSystemStorageBackend(UnifiedStorageBackend):
+    """File-system storage backend — local object storage for artifacts.
+
+    Layout (all paths are namespaced by tenant, never sharing directories):
+
+        <root>/<tenant_id>/sessions/<session_id>.json
+        <root>/<tenant_id>/events/<session_id>.jsonl
+        <root>/<tenant_id>/memory/<user_id>/<memory_id>.json
+        <root>/<tenant_id>/knowledge/<item_id>.json
+        <root>/<tenant_id>/audit/audit.jsonl
+        <root>/<tenant_id>/summaries/<session_id>.txt
+        <root>/<tenant_id>/artifacts/<artifact_id>        (raw bytes)
+        <root>/<tenant_id>/artifacts/<artifact_id>.meta.json
+
+    Suited for single-node deployments and as a drop-in local object store;
+    for S3/OSS/MinIO, register a custom factory via
+    ``StorageRouter.register_backend_factory`` implementing the same interface.
+    """
+
+    def __init__(self, root: str = "./tenant_storage"):
+        self._root = root
+
+    # -- path helpers ------------------------------------------------------
+
+    def _component(self, *parts: str) -> str:
+        """Build a safe relative path, rejecting separators/parent refs."""
+        for part in parts:
+            if not part or "/" in part or "\\" in part or part in (".", ".."):
+                raise ValueError(f"Unsafe path component: {part!r}")
+        return os.path.join(self._root, *parts)
+
+    @staticmethod
+    def _run_sync(func, *args):
+        return asyncio.get_event_loop().run_in_executor(None, functools.partial(func, *args))
+
+    def _write_text(self, path: str, text: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read_text(self, path: str) -> Optional[str]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def _append_text(self, path: str, text: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+
+    # -- sessions ----------------------------------------------------------
+
+    def _session_path(self, tenant_id: str, session_id: str) -> str:
+        return self._component(tenant_id, "sessions", f"{session_id}.json")
+
+    async def get_session(self, tenant_id: str, session_id: str) -> Optional[Session]:
+        raw = await self._run_sync(self._read_text, self._session_path(tenant_id, session_id))
+        if raw is None:
+            return None
+        return Session(**json.loads(raw))
+
+    async def save_session(self, tenant_id: str, session: Session) -> None:
+        data = session.model_dump()
+        await self._run_sync(self._write_text, self._session_path(tenant_id, session.id), json.dumps(data))
+
+    def _events_path(self, tenant_id: str, session_id: str) -> str:
+        return self._component(tenant_id, "events", f"{session_id}.jsonl")
+
+    async def add_session_event(self, tenant_id: str, session_id: str, event: Event) -> None:
+        event_data = {
+            "author": event.author,
+            "content": {
+                "parts": [{
+                    "text": part.text
+                } for part in event.content.parts]
+            } if event.content else [],
+            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+        }
+        await self._run_sync(self._append_text, self._events_path(tenant_id, session_id), json.dumps(event_data) + "\n")
+
+    # -- memory ------------------------------------------------------------
+
+    def _memory_path(self, tenant_id: str, user_id: str, memory_id: str) -> str:
+        return self._component(tenant_id, "memory", user_id, f"{memory_id}.json")
+
+    async def get_memory(self, tenant_id: str, user_id: str, memory_id: str) -> Optional[Dict[str, Any]]:
+        raw = await self._run_sync(self._read_text, self._memory_path(tenant_id, user_id, memory_id))
+        return json.loads(raw) if raw is not None else None
+
+    async def save_memory(self, tenant_id: str, user_id: str, memory_data: Dict[str, Any]) -> None:
+        memory_id = memory_data.get("id", f"mem_{uuid.uuid4().hex[:12]}")
+        memory_data["id"] = memory_id
+        await self._run_sync(self._write_text, self._memory_path(tenant_id, user_id, memory_id),
+                             json.dumps(memory_data))
+
+    # -- knowledge ---------------------------------------------------------
+
+    def _knowledge_dir(self, tenant_id: str) -> str:
+        return self._component(tenant_id, "knowledge")
+
+    async def search_knowledge(self, tenant_id: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        directory = self._knowledge_dir(tenant_id)
+
+        def _scan():
+            if not os.path.isdir(directory):
+                return []
+            hits = []
+            for name in sorted(os.listdir(directory)):
+                if not name.endswith(".json"):
+                    continue
+                with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
+                    item = json.load(f)
+                if query.lower() in str(item).lower():
+                    hits.append(item)
+                    if len(hits) >= limit:
+                        break
+            return hits
+
+        return await self._run_sync(_scan)
+
+    # -- audit -------------------------------------------------------------
+
+    async def save_audit_log(self, tenant_id: str, audit_data: Dict[str, Any]) -> None:
+        path = self._component(tenant_id, "audit", "audit.jsonl")
+        await self._run_sync(self._append_text, path, json.dumps(audit_data) + "\n")
+
+    # -- summary -----------------------------------------------------------
+
+    def _summary_path(self, tenant_id: str, session_id: str) -> str:
+        return self._component(tenant_id, "summaries", f"{session_id}.txt")
+
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        await self._run_sync(self._write_text, self._summary_path(tenant_id, session_id), summary)
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        return await self._run_sync(self._read_text, self._summary_path(tenant_id, session_id))
+
+    # -- artifacts (the primary use case: local object storage) ------------
+
+    def _artifact_path(self, tenant_id: str, artifact_id: str) -> str:
+        return self._component(tenant_id, "artifacts", artifact_id)
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        descriptor = {
+            "artifact_id": artifact_id,
+            "tenant_id": tenant_id,
+            "size": len(data),
+            "metadata": dict(metadata or {}),
+        }
+
+        def _write():
+            data_path = self._artifact_path(tenant_id, artifact_id)
+            os.makedirs(os.path.dirname(data_path), exist_ok=True)
+            with open(data_path, "wb") as f:
+                f.write(data)
+            with open(data_path + ".meta.json", "w", encoding="utf-8") as f:
+                json.dump(descriptor, f)
+
+        await self._run_sync(_write)
+        return descriptor
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        data_path = self._artifact_path(tenant_id, artifact_id)
+
+        def _read():
+            try:
+                with open(data_path, "rb") as f:
+                    blob = f.read()
+                with open(data_path + ".meta.json", "r", encoding="utf-8") as f:
+                    descriptor = json.load(f)
+                return blob, descriptor
+            except FileNotFoundError:
+                return None, None
+
+        blob, descriptor = await self._run_sync(_read)
+        if blob is None:
+            return None
+        return {"data": blob, "metadata": descriptor.get("metadata", {})}
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        data_path = self._artifact_path(tenant_id, artifact_id)
+
+        def _delete():
+            existed = os.path.exists(data_path)
+            for path in (data_path, data_path + ".meta.json"):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            return existed
+
+        return await self._run_sync(_delete)
+
+    # -- health ------------------------------------------------------------
+
+    async def health_check(self) -> bool:
+        try:
+            await self._run_sync(os.makedirs, self._root, True)
+            probe = os.path.join(self._root, ".health_probe")
+            await self._run_sync(self._write_text, probe, "ok")
+            return True
+        except Exception as e:
+            logger.error(f"File system health check failed: {e}")
             return False
 
 
@@ -591,7 +975,24 @@ class SQLStorageBackend(UnifiedStorageBackend):
                 event_json = Column(Text)
                 created_at = Column(DateTime)
 
-            Base.metadata.create_all(self._engine)
+            class SummaryRecord(Base):
+                __tablename__ = "summaries"
+                tenant_id = Column(String(64), primary_key=True)
+                session_id = Column(String(64), primary_key=True)
+                summary = Column(Text)
+                updated_at = Column(DateTime)
+
+            class ArtifactRecord(Base):
+                __tablename__ = "artifacts"
+                tenant_id = Column(String(64), primary_key=True)
+                artifact_id = Column(String(256), primary_key=True)
+                data = Column(Text)  # base64-encoded bytes (portable across drivers)
+                metadata_json = Column(Text)
+                updated_at = Column(DateTime)
+
+            # AsyncEngine requires DDL via run_sync on a connection
+            async with self._engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
 
     async def _get_session(self):
         """Get database session."""
@@ -733,3 +1134,121 @@ class SQLStorageBackend(UnifiedStorageBackend):
         except Exception as e:
             logger.error(f"SQL health check failed: {e}")
             return False
+
+    async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
+        session_db = await self._get_session()
+
+        try:
+            from datetime import datetime
+            from sqlalchemy import text
+
+            await session_db.execute(
+                text("""
+                    INSERT OR REPLACE INTO summaries (tenant_id, session_id, summary, updated_at)
+                    VALUES (:tid, :sid, :summary, :updated_at)
+                """), {
+                    "tid": tenant_id,
+                    "sid": session_id,
+                    "summary": summary,
+                    "updated_at": datetime.utcnow(),
+                })
+            await session_db.commit()
+        except Exception:
+            await session_db.rollback()
+            raise
+        finally:
+            await session_db.close()
+
+    async def get_summary(self, tenant_id: str, session_id: str) -> Optional[str]:
+        session_db = await self._get_session()
+
+        try:
+            from sqlalchemy import text
+
+            result = await session_db.execute(
+                text("SELECT summary FROM summaries WHERE tenant_id = :tid AND session_id = :sid"), {
+                    "tid": tenant_id,
+                    "sid": session_id,
+                })
+            row = result.fetchone()
+            return row.summary if row else None
+        finally:
+            await session_db.close()
+
+    async def save_artifact(self,
+                            tenant_id: str,
+                            artifact_id: str,
+                            data: bytes,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        session_db = await self._get_session()
+
+        try:
+            from datetime import datetime
+            from sqlalchemy import text
+
+            descriptor = {
+                "artifact_id": artifact_id,
+                "tenant_id": tenant_id,
+                "size": len(data),
+                "metadata": dict(metadata or {}),
+            }
+            await session_db.execute(
+                text("""
+                    INSERT OR REPLACE INTO artifacts
+                        (tenant_id, artifact_id, data, metadata_json, updated_at)
+                    VALUES (:tid, :aid, :data, :metadata, :updated_at)
+                """), {
+                    "tid": tenant_id,
+                    "aid": artifact_id,
+                    "data": base64.b64encode(data).decode("ascii"),
+                    "metadata": json.dumps(descriptor),
+                    "updated_at": datetime.utcnow(),
+                })
+            await session_db.commit()
+            return descriptor
+        except Exception:
+            await session_db.rollback()
+            raise
+        finally:
+            await session_db.close()
+
+    async def get_artifact(self, tenant_id: str, artifact_id: str) -> Optional[Dict[str, Any]]:
+        session_db = await self._get_session()
+
+        try:
+            from sqlalchemy import text
+
+            result = await session_db.execute(
+                text("SELECT data, metadata_json FROM artifacts WHERE tenant_id = :tid AND artifact_id = :aid"), {
+                    "tid": tenant_id,
+                    "aid": artifact_id,
+                })
+            row = result.fetchone()
+            if not row:
+                return None
+            metadata = json.loads(row.metadata_json) if row.metadata_json else {}
+            return {
+                "data": base64.b64decode(row.data.encode("ascii")),
+                "metadata": metadata.get("metadata", {}),
+            }
+        finally:
+            await session_db.close()
+
+    async def delete_artifact(self, tenant_id: str, artifact_id: str) -> bool:
+        session_db = await self._get_session()
+
+        try:
+            from sqlalchemy import text
+
+            result = await session_db.execute(
+                text("DELETE FROM artifacts WHERE tenant_id = :tid AND artifact_id = :aid"), {
+                    "tid": tenant_id,
+                    "aid": artifact_id,
+                })
+            await session_db.commit()
+            return result.rowcount > 0
+        except Exception:
+            await session_db.rollback()
+            raise
+        finally:
+            await session_db.close()

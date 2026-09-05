@@ -106,14 +106,40 @@ store = TenantStoreWithFallback(
 | 函数 | 用途 |
 |---|---|
 | `nodes_for_qps(target_qps, per_node_qps, headroom_percent=30)` | 目标 QPS → 节点数（默认 30% 余量，覆盖滚动发布与流量毛刺） |
+| `nodes_for_sessions(target_sessions, per_node_sessions, headroom_percent=30)` | 并发 session 维度 → 节点数（流式/IM 长连接可能先于 QPS 打满内存/连接数） |
 | `project_month_end_usage(mtd, today)` | 月初至今用量线性外推到月末 |
 | `budget_headroom(budget, cost_mtd, today)` | 租户月末预算余量（负值 = 预计超支） |
-| `capacity_plan(...)` | 一次性生成 `CapacityReport`：节点数 + 各租户预算外推行 + `summary()` JSON |
+| `capacity_plan(..., concurrent_sessions=0, per_node_sessions=0)` | 一次性生成 `CapacityReport`：节点数取 **max(QPS 维度, session 维度)** + 各租户预算外推行 + `summary()` JSON |
 
 数据来源：`get_tenant_metrics().render_prometheus()` 里的
 `tenant_requests_total` / `tenant_cost_usd_total`（阶段三埋点），
 按天聚合出 month-to-date 值后调用 `capacity_plan`。超支租户由
-`report.tenants_over_budget()` 列出，接入告警。
+`report.tenants_over_budget()` 列出，接入告警。IM/流式租户还应观测
+并发 session 数（网关侧统计活跃连接）传入 `concurrent_sessions`，
+`per_node_sessions` 参照 `AppConfig.max_concurrent_sessions` 的单节点实测值。
+
+## 4.1 密钥管理
+
+运行时脱敏（审计日志/API 响应中的密钥打码）已在 `_audit.py` 实现；密钥的
+**存储与流转** 遵循以下规范：
+
+1. **注入方式**：所有密钥（`ModelConfig.api_key`、`ChannelConfig.webhook_secret`
+   / `api_key`、数据库/Redis 口令）经环境变量或 K8s Secret / 密钥管理服务
+   （KMS/Vault）注入容器，**禁止写进代码、镜像层或明文入库**；
+2. **租户存储**：租户配置若必须落库，密钥字段在应用层加密（envelope
+   encryption：数据密钥加密字段值，主密钥托管 KMS），SQL/Redis 均视为
+   不受信存储；
+3. **轮换流程**：
+   - 模型 API Key：新 Key 写入 Secret → 滚动重启 Worker（无状态，秒级完成）
+     → 旧 Key 在供应商侧吊销；
+   - IM webhook secret：轮换期间双 secret 并行验签（新租户配置先加
+     `webhook_secret_new`，观察期后删除旧值）；
+   - 数据库口令：先加新账号授权迁移，再回收旧账号；
+4. **泄漏响应**：立即吊销 → 轮换 → 审计日志排查泄漏窗口（audit log 含
+   trace_id 可回溯调用链）→ 复盘注入路径；
+5. **审计脱敏闭环**：任何密钥进入日志前必须过 `_audit.py` 脱敏；
+   Admin API 响应中的 `llm_config` 等含密钥字段同样视为敏感数据，
+   生产部署时 Admin 端口仅内网可达并加管理员鉴权。
 
 ## 5. 单测覆盖
 
