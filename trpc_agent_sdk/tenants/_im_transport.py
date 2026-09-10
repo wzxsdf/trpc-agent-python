@@ -29,6 +29,50 @@ from trpc_agent_sdk.log import logger
 RetryableFunc = Callable[[], Awaitable[bool]]
 """Async callable returning True on success, False on retryable failure."""
 
+# How long to stay on the in-memory fallback after a Redis failure before
+# probing the shared backend again. Shared by every Redis-backed component
+# that degrades to per-process state (rate limiter, deduplicator, usage
+# tracker) via :class:`RedisFallbackMixin`.
+REDIS_RETRY_INTERVAL_SECONDS = 30.0
+
+# Backwards-compatible alias used by earlier revisions of this module.
+_REDIS_RETRY_INTERVAL_SECONDS = REDIS_RETRY_INTERVAL_SECONDS
+
+
+class RedisFallbackMixin:
+    """Shared "degrade to in-memory when Redis is down" state machine.
+
+    Redis outages only degrade cross-node accuracy of best-effort features
+    (dedup, rate limiting, usage accounting), so instead of abandoning the
+    shared backend for the process lifetime we stay on the in-memory fallback
+    for :data:`REDIS_RETRY_INTERVAL_SECONDS` and then probe Redis again.
+    """
+
+    _redis_retry_interval = REDIS_RETRY_INTERVAL_SECONDS
+
+    def _init_fallback_state(self) -> None:
+        """Reset the fallback tracking state (call from ``__init__``)."""
+        # Mono timestamp of the last Redis failure.
+        self._redis_failed_at: Optional[float] = None
+
+    def _redis_down(self) -> bool:
+        """Whether to keep using the in-memory fallback.
+
+        After the retry interval elapses the shared backend is probed again,
+        so a short Redis blip does not degrade the component for the process
+        lifetime.
+        """
+        if self._redis_failed_at is None:
+            return False
+        if time.monotonic() - self._redis_failed_at >= self._redis_retry_interval:
+            self._redis_failed_at = None
+            return False
+        return True
+
+    def _mark_redis_failed(self) -> None:
+        """Record a Redis failure and switch to the in-memory fallback."""
+        self._redis_failed_at = time.monotonic()
+
 
 class MessageChunker:
     """Splits long message text into platform-size chunks."""
@@ -77,7 +121,7 @@ class MessageChunker:
         return chunks
 
 
-class RateLimiter:
+class RateLimiter(RedisFallbackMixin):
     """Fixed-window per-tenant/channel rate limiter.
 
     Uses a Redis counter keyed ``im_rate:{tenant_id}:{channel}`` with a
@@ -99,7 +143,7 @@ class RateLimiter:
 
         self._redis_url = redis_url
         self._redis = None
-        self._redis_failed = False
+        self._init_fallback_state()
         # In-memory fallback: {key: (window_start, count)}
         self._local_windows: Dict[str, Any] = {}
 
@@ -126,7 +170,7 @@ class RateLimiter:
             return True
         key = f"im_rate:{tenant_id}:{channel_type}"
 
-        if not self._redis_failed:
+        if not self._redis_down():
             try:
                 redis_client = await self._get_redis()
                 count = await redis_client.incr(key)
@@ -136,7 +180,7 @@ class RateLimiter:
             except Exception as e:
                 logger.warning(f"Redis rate limiting unavailable, "
                                f"falling back to in-memory: {e}")
-                self._redis_failed = True
+                self._mark_redis_failed()
 
         now = time.monotonic()
         window_start, count = self._local_windows.get(key, (now, 0))

@@ -24,6 +24,67 @@ from trpc_agent_sdk.events import Event
 from trpc_agent_sdk.log import logger
 
 
+def serialize_event(event: Event) -> str:
+    """Serialize an :class:`~trpc_agent_sdk.events.Event` with full fidelity.
+
+    Uses the same canonical round-trip form as the SDK session services
+    (``model_dump(exclude_none=True, mode="json")``) so that function calls,
+    function responses and other structured fields survive storage instead
+    of being reduced to plain text.
+    """
+    return json.dumps(event.model_dump(exclude_none=True, mode="json"), ensure_ascii=False)
+
+
+def _audit_ddl_statements(dialect: str) -> List[str]:
+    """Return the canonical ``audit_logs`` DDL statements for a SQL dialect.
+
+    Statements are taken verbatim from :mod:`trpc_agent_sdk.tenants._sql_ddl`
+    so the unified backend and the tenant schema never drift apart.
+
+    Only the ``mysql``/``mariadb`` and ``sqlite`` dialect families have DDL
+    variants; for any other dialect (e.g. PostgreSQL) an empty list is
+    returned — creating SQLite-flavoured DDL there would crash with syntax
+    errors. Callers must warn so operators know to run :class:`SchemaMigrator`
+    against a supported database first.
+    """
+    from trpc_agent_sdk.tenants._sql_ddl import TENANT_TABLES_DDL_MYSQL, TENANT_TABLES_DDL_SQLITE
+
+    if dialect in ("mysql", "mariadb"):
+        ddl = TENANT_TABLES_DDL_MYSQL
+    elif dialect == "sqlite":
+        ddl = TENANT_TABLES_DDL_SQLITE
+    else:
+        return []
+    return [s for s in ddl if "audit_logs" in s]
+
+
+# Legacy (pre-rename) unified-backend tables and the column fingerprint that
+# identifies them. The SDK SqlSessionService owns same-named "sessions"/"events"
+# tables with a completely different column set (state / historical_events /
+# invocation_id / ... instead of payload_json / event_json), so a rename is only
+# performed when the exact legacy shape matches — otherwise the table is left
+# untouched.
+_LEGACY_TABLE_MIGRATIONS = (
+    ("sessions", "unified_sessions", {"id", "tenant_id", "app_name", "user_id", "payload_json", "created_at"}),
+    ("events", "unified_events", {"id", "tenant_id", "session_id", "event_json", "created_at"}),
+    ("summaries", "unified_summaries", {"tenant_id", "session_id", "summary", "updated_at"}),
+    ("artifacts", "unified_artifacts", {"tenant_id", "artifact_id", "data", "metadata_json", "updated_at"}),
+)
+
+
+def _to_float(value: Any) -> float:
+    """Coerce an audit numeric field to float, defaulting to 0.0.
+
+    A malformed value (e.g. a string that is not a number) must not abort
+    the whole audit write — losing one number is better than losing the
+    entire governance record.
+    """
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class StorageBackendType(Enum):
     """Supported storage backend types."""
 
@@ -578,20 +639,8 @@ class RedisStorageBackend(UnifiedStorageBackend):
         redis_client = await self._get_redis()
         key = self._events_key(tenant_id, session_id)
 
-        # Serialize event (simplified, use proper serialization in production)
-        import json
-        event_data = {
-            "author": event.author,
-            "content": {
-                "parts": [{
-                    "text": part.text
-                } for part in event.content.parts]
-            } if event.content else [],
-            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
-        }
-
         # Use Redis list for events (in production, consider streams)
-        await redis_client.rpush(key, json.dumps(event_data))
+        await redis_client.rpush(key, serialize_event(event))
 
     async def get_memory(self, tenant_id: str, user_id: str, memory_id: str) -> Optional[Dict[str, Any]]:
         redis_client = await self._get_redis()
@@ -633,10 +682,12 @@ class RedisStorageBackend(UnifiedStorageBackend):
 
     async def save_audit_log(self, tenant_id: str, audit_data: Dict[str, Any]) -> None:
         redis_client = await self._get_redis()
-        key = f"{self._tenant_prefix(tenant_id)}:audit:{int(asyncio.get_event_loop().time())}"
+        # Append to a per-tenant list: audit entries must never overwrite each
+        # other (a seconds-resolution key previously collided under load).
+        key = f"{self._tenant_prefix(tenant_id)}:audit"
 
         import json
-        await redis_client.set(key, json.dumps(audit_data))
+        await redis_client.rpush(key, json.dumps(audit_data, ensure_ascii=False, default=str))
 
     async def save_summary(self, tenant_id: str, session_id: str, summary: str) -> None:
         redis_client = await self._get_redis()
@@ -763,16 +814,7 @@ class FileSystemStorageBackend(UnifiedStorageBackend):
         return self._component(tenant_id, "events", f"{session_id}.jsonl")
 
     async def add_session_event(self, tenant_id: str, session_id: str, event: Event) -> None:
-        event_data = {
-            "author": event.author,
-            "content": {
-                "parts": [{
-                    "text": part.text
-                } for part in event.content.parts]
-            } if event.content else [],
-            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
-        }
-        await self._run_sync(self._append_text, self._events_path(tenant_id, session_id), json.dumps(event_data) + "\n")
+        await self._run_sync(self._append_text, self._events_path(tenant_id, session_id), serialize_event(event) + "\n")
 
     # -- memory ------------------------------------------------------------
 
@@ -909,6 +951,14 @@ class SQLStorageBackend(UnifiedStorageBackend):
 
     This implementation provides ACID transactions, complex querying,
     and data persistence with backup/restore capabilities.
+
+    Table naming: this backend owns the ``unified_*`` tables (its own
+    namespace) so it never collides with the canonical eight-table tenant
+    schema (:mod:`trpc_agent_sdk.tenants._sql_ddl`) or the SDK
+    ``SqlSessionService`` tables, which use different column layouts.
+    Audit logs are the exception — they are written to the canonical
+    ``audit_logs`` table (created on demand from the same DDL) so that the
+    governance trail lives in one place.
     """
 
     def __init__(self, database_url: str = "sqlite:///./storage.db"):
@@ -933,7 +983,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
         if self._engine is None:
             from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
             from sqlalchemy.orm import sessionmaker
-            from sqlalchemy import Column, String, Text, DateTime, Integer
+            from sqlalchemy import Column, String, Text, DateTime, Integer, text
             from sqlalchemy.ext.declarative import declarative_base
 
             # Convert sqlite:// to sqlite+aiosqlite:// for async support
@@ -944,11 +994,13 @@ class SQLStorageBackend(UnifiedStorageBackend):
             self._engine = create_async_engine(db_url, echo=False)
             self._session_factory = sessionmaker(bind=self._engine, class_=AsyncSession, expire_on_commit=False)
 
-            # Create tables (simplified, proper schema needed in production)
+            # Create tables. The unified_* namespace keeps this backend's
+            # tables disjoint from the canonical tenant DDL and the SDK
+            # SqlSessionService schema.
             Base = declarative_base()
 
             class SessionRecord(Base):
-                __tablename__ = "sessions"
+                __tablename__ = "unified_sessions"
                 id = Column(String(64), primary_key=True)
                 tenant_id = Column(String(64), nullable=False, index=True)
                 app_name = Column(String(256))
@@ -957,7 +1009,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
                 created_at = Column(DateTime)
 
             class EventRecord(Base):
-                __tablename__ = "events"
+                __tablename__ = "unified_events"
                 id = Column(Integer, primary_key=True, autoincrement=True)
                 tenant_id = Column(String(64), nullable=False, index=True)
                 session_id = Column(String(64), nullable=False, index=True)
@@ -965,14 +1017,14 @@ class SQLStorageBackend(UnifiedStorageBackend):
                 created_at = Column(DateTime)
 
             class SummaryRecord(Base):
-                __tablename__ = "summaries"
+                __tablename__ = "unified_summaries"
                 tenant_id = Column(String(64), primary_key=True)
                 session_id = Column(String(64), primary_key=True)
                 summary = Column(Text)
                 updated_at = Column(DateTime)
 
             class ArtifactRecord(Base):
-                __tablename__ = "artifacts"
+                __tablename__ = "unified_artifacts"
                 tenant_id = Column(String(64), primary_key=True)
                 artifact_id = Column(String(256), primary_key=True)
                 data = Column(Text)  # base64-encoded bytes (portable across drivers)
@@ -981,12 +1033,67 @@ class SQLStorageBackend(UnifiedStorageBackend):
 
             # AsyncEngine requires DDL via run_sync on a connection
             async with self._engine.begin() as conn:
+
+                def _migrate_legacy_tables(sync_conn) -> None:
+                    """Rename pre-rename unified tables to the unified_* namespace.
+
+                    A rename only happens when the legacy table exists, the
+                    target does not, and its column set matches the legacy
+                    shape exactly (see ``_LEGACY_TABLE_MIGRATIONS``) — this
+                    keeps the SDK SqlSessionService's same-named tables safe.
+                    """
+                    from sqlalchemy import inspect
+
+                    inspector = inspect(sync_conn)
+                    tables = set(inspector.get_table_names())
+                    for legacy, unified, fingerprint in _LEGACY_TABLE_MIGRATIONS:
+                        if legacy not in tables or unified in tables:
+                            continue
+                        columns = {c["name"] for c in inspector.get_columns(legacy)}
+                        if columns != fingerprint:
+                            logger.info(f"Table '{legacy}' does not match the legacy unified shape; "
+                                        f"leaving it untouched")
+                            continue
+                        sync_conn.exec_driver_sql(f"ALTER TABLE {legacy} RENAME TO {unified}")
+                        logger.info(f"Migrated legacy unified table '{legacy}' -> '{unified}'")
+
+                await conn.run_sync(_migrate_legacy_tables)
                 await conn.run_sync(Base.metadata.create_all)
+                # Audit logs go to the canonical audit_logs table so the
+                # governance trail is shared with the tenant DDL schema;
+                # create it (idempotently) if SchemaMigrator has not run yet.
+                statements = _audit_ddl_statements(self._engine.dialect.name)
+                if statements:
+                    for statement in statements:
+                        await conn.execute(text(statement))
+                else:
+                    logger.warning(f"audit_logs table not auto-created for dialect "
+                                   f"'{self._engine.dialect.name}'; run "
+                                   f"trpc_agent_sdk.tenants._sql_migrations against the "
+                                   f"database before writing audit logs")
 
     async def _get_session(self):
         """Get database session."""
         await self._initialize()
         return self._session_factory()
+
+    def _upsert_sql(self, table: str, columns: List[str], pk_columns: List[str], update_columns: List[str]) -> str:
+        """Build a dialect-appropriate UPSERT statement.
+
+        SQLite/PostgreSQL use ``INSERT ... ON CONFLICT DO UPDATE``;
+        MySQL/TiDB use ``INSERT ... ON DUPLICATE KEY UPDATE``. The previous
+        hardcoded ``INSERT OR REPLACE`` is SQLite-only syntax.
+        """
+        collist = ", ".join(columns)
+        placeholders = ", ".join(f":{c}" for c in columns)
+        if self._engine is not None and self._engine.dialect.name == "mysql":
+            updates = ", ".join(f"{c} = :{c}" for c in update_columns)
+            return (f"INSERT INTO {table} ({collist}) VALUES ({placeholders}) "
+                    f"ON DUPLICATE KEY UPDATE {updates}")
+        pk = ", ".join(pk_columns)
+        updates = ", ".join(f"{c} = excluded.{c}" for c in update_columns)
+        return (f"INSERT INTO {table} ({collist}) VALUES ({placeholders}) "
+                f"ON CONFLICT ({pk}) DO UPDATE SET {updates}")
 
     async def get_session(self, tenant_id: str, session_id: str) -> Optional[Session]:
         session = await self._get_session()
@@ -995,7 +1102,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from sqlalchemy import text
 
             result = await session.execute(
-                text("SELECT payload_json FROM sessions WHERE id = :sid AND tenant_id = :tid"), {
+                text("SELECT payload_json FROM unified_sessions WHERE id = :sid AND tenant_id = :tid"), {
                     "sid": session_id,
                     "tid": tenant_id
                 })
@@ -1015,16 +1122,17 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from datetime import datetime
             from sqlalchemy import text
 
+            stmt = self._upsert_sql(table="unified_sessions",
+                                    columns=["id", "tenant_id", "app_name", "user_id", "payload_json", "created_at"],
+                                    pk_columns=["id"],
+                                    update_columns=["app_name", "user_id", "payload_json"])
             await session_db.execute(
-                text("""
-                    INSERT OR REPLACE INTO sessions (id, tenant_id, app_name, user_id, payload_json, created_at)
-                    VALUES (:id, :tid, :app_name, :user_id, :payload, :created_at)
-                """), {
+                text(stmt), {
                     "id": session.id,
-                    "tid": tenant_id,
+                    "tenant_id": tenant_id,
                     "app_name": session.app_name,
                     "user_id": session.user_id,
-                    "payload": json.dumps(session.model_dump(), ensure_ascii=False),
+                    "payload_json": json.dumps(session.model_dump(), ensure_ascii=False),
                     "created_at": datetime.utcnow(),
                 })
             await session_db.commit()
@@ -1038,28 +1146,17 @@ class SQLStorageBackend(UnifiedStorageBackend):
         session_db = await self._get_session()
 
         try:
-            import json
             from datetime import datetime
             from sqlalchemy import text
 
-            event_json = {
-                "author": event.author,
-                "content": {
-                    "parts": [{
-                        "text": part.text
-                    } for part in event.content.parts] if event.content else []
-                },
-                "timestamp": event.timestamp.isoformat() if event.timestamp else datetime.utcnow().isoformat(),
-            }
-
             await session_db.execute(
                 text("""
-                    INSERT INTO events (tenant_id, session_id, event_json, created_at)
+                    INSERT INTO unified_events (tenant_id, session_id, event_json, created_at)
                     VALUES (:tid, :sid, :event_json, :created_at)
                 """), {
                     "tid": tenant_id,
                     "sid": session_id,
-                    "event_json": json.dumps(event_json),
+                    "event_json": serialize_event(event),
                     "created_at": datetime.utcnow(),
                 })
             await session_db.commit()
@@ -1082,6 +1179,12 @@ class SQLStorageBackend(UnifiedStorageBackend):
         return []
 
     async def save_audit_log(self, tenant_id: str, audit_data: Dict[str, Any]) -> None:
+        """Write an audit entry to the canonical ``audit_logs`` table.
+
+        Column layout matches :data:`~trpc_agent_sdk.tenants._sql_ddl.TENANT_TABLES_DDL_SQLITE`;
+        the whole ``audit_data`` payload is additionally preserved in
+        ``details_json`` so nothing is lost by the typed columns.
+        """
         session_db = await self._get_session()
 
         try:
@@ -1091,11 +1194,25 @@ class SQLStorageBackend(UnifiedStorageBackend):
 
             await session_db.execute(
                 text("""
-                    INSERT INTO audit_logs (tenant_id, audit_json, created_at)
-                    VALUES (:tid, :audit_json, :created_at)
+                    INSERT INTO audit_logs (tenant_id, channel, user_id, session_id, agent_name, tool_name,
+                                            decision, latency_ms, error_type, cost_usd, trace_id,
+                                            details_json, created_at)
+                    VALUES (:tenant_id, :channel, :user_id, :session_id, :agent_name, :tool_name,
+                            :decision, :latency_ms, :error_type, :cost_usd, :trace_id,
+                            :details_json, :created_at)
                 """), {
-                    "tid": tenant_id,
-                    "audit_json": json.dumps(audit_data),
+                    "tenant_id": tenant_id,
+                    "channel": audit_data.get("channel") or "api",
+                    "user_id": audit_data.get("user_id") or "",
+                    "session_id": audit_data.get("session_id") or "",
+                    "agent_name": audit_data.get("agent_name") or "",
+                    "tool_name": audit_data.get("tool_name") or "",
+                    "decision": audit_data.get("decision") or "unknown",
+                    "latency_ms": _to_float(audit_data.get("latency_ms")),
+                    "error_type": audit_data.get("error_type") or "",
+                    "cost_usd": _to_float(audit_data.get("cost_usd")),
+                    "trace_id": audit_data.get("trace_id") or "",
+                    "details_json": json.dumps(audit_data.get("details") or {}, ensure_ascii=False, default=str),
                     "created_at": datetime.utcnow(),
                 })
             await session_db.commit()
@@ -1124,16 +1241,16 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from datetime import datetime
             from sqlalchemy import text
 
-            await session_db.execute(
-                text("""
-                    INSERT OR REPLACE INTO summaries (tenant_id, session_id, summary, updated_at)
-                    VALUES (:tid, :sid, :summary, :updated_at)
-                """), {
-                    "tid": tenant_id,
-                    "sid": session_id,
-                    "summary": summary,
-                    "updated_at": datetime.utcnow(),
-                })
+            stmt = self._upsert_sql(table="unified_summaries",
+                                    columns=["tenant_id", "session_id", "summary", "updated_at"],
+                                    pk_columns=["tenant_id", "session_id"],
+                                    update_columns=["summary", "updated_at"])
+            await session_db.execute(text(stmt), {
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "summary": summary,
+                "updated_at": datetime.utcnow(),
+            })
             await session_db.commit()
         except Exception:
             await session_db.rollback()
@@ -1148,7 +1265,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from sqlalchemy import text
 
             result = await session_db.execute(
-                text("SELECT summary FROM summaries WHERE tenant_id = :tid AND session_id = :sid"), {
+                text("SELECT summary FROM unified_summaries WHERE tenant_id = :tid AND session_id = :sid"), {
                     "tid": tenant_id,
                     "sid": session_id,
                 })
@@ -1174,16 +1291,16 @@ class SQLStorageBackend(UnifiedStorageBackend):
                 "size": len(data),
                 "metadata": dict(metadata or {}),
             }
+            stmt = self._upsert_sql(table="unified_artifacts",
+                                    columns=["tenant_id", "artifact_id", "data", "metadata_json", "updated_at"],
+                                    pk_columns=["tenant_id", "artifact_id"],
+                                    update_columns=["data", "metadata_json", "updated_at"])
             await session_db.execute(
-                text("""
-                    INSERT OR REPLACE INTO artifacts
-                        (tenant_id, artifact_id, data, metadata_json, updated_at)
-                    VALUES (:tid, :aid, :data, :metadata, :updated_at)
-                """), {
-                    "tid": tenant_id,
-                    "aid": artifact_id,
+                text(stmt), {
+                    "tenant_id": tenant_id,
+                    "artifact_id": artifact_id,
                     "data": base64.b64encode(data).decode("ascii"),
-                    "metadata": json.dumps(descriptor),
+                    "metadata_json": json.dumps(descriptor),
                     "updated_at": datetime.utcnow(),
                 })
             await session_db.commit()
@@ -1201,7 +1318,8 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from sqlalchemy import text
 
             result = await session_db.execute(
-                text("SELECT data, metadata_json FROM artifacts WHERE tenant_id = :tid AND artifact_id = :aid"), {
+                text("SELECT data, metadata_json FROM unified_artifacts WHERE tenant_id = :tid AND artifact_id = :aid"),
+                {
                     "tid": tenant_id,
                     "aid": artifact_id,
                 })
@@ -1223,7 +1341,7 @@ class SQLStorageBackend(UnifiedStorageBackend):
             from sqlalchemy import text
 
             result = await session_db.execute(
-                text("DELETE FROM artifacts WHERE tenant_id = :tid AND artifact_id = :aid"), {
+                text("DELETE FROM unified_artifacts WHERE tenant_id = :tid AND artifact_id = :aid"), {
                     "tid": tenant_id,
                     "aid": artifact_id,
                 })

@@ -11,8 +11,8 @@ throughout the agent execution pipeline.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
-from threading import local
 
 from ._tenant_model import Tenant
 
@@ -93,17 +93,29 @@ class TenantContext:
 
 
 class TenantContextManager:
-    """Thread-local tenant context manager for async operations.
+    """Copy-on-write tenant context registry backed by ``contextvars``.
 
-    This class provides a way to store and retrieve tenant context
-    throughout the execution of a request, ensuring tenant isolation
-    in multi-threaded/async environments.
+    The context map lives in a :class:`~contextvars.ContextVar` holding an
+    immutable snapshot (a dict that is only ever replaced, never mutated).
+    :meth:`with_tenant` copies the snapshot, adds its context, and restores
+    the previous snapshot via token reset on exit. This gives:
+
+    - per-task isolation in asyncio (concurrent requests on one thread do
+      not observe or clear each other's tenant context, unlike a shared
+      dict), and per-thread isolation for sync code;
+    - correct nesting: an inner ``with_tenant`` for the same tenant no
+      longer deletes the outer scope's context when it exits, because each
+      scope restores its own snapshot.
     """
 
     def __init__(self):
-        """Initialize tenant context manager with thread-local storage."""
-        self._local = local()
-        self._contexts: Dict[str, TenantContext] = {}
+        """Initialize the manager with an empty context snapshot."""
+        self._contexts: ContextVar = ContextVar("tenant_contexts", default=None)
+
+    def _snapshot(self) -> Dict[str, TenantContext]:
+        """Return the current immutable context map (empty when unset)."""
+        current = self._contexts.get()
+        return current if current is not None else {}
 
     @contextmanager
     def with_tenant(self, tenant: Tenant):
@@ -122,14 +134,15 @@ class TenantContextManager:
             ...     model_config = context.get_model_config()
         """
         context = TenantContext(tenant)
-        self._contexts[tenant.tenant_id] = context
-
+        merged = dict(self._snapshot())
+        merged[tenant.tenant_id] = context
+        token = self._contexts.set(merged)
         try:
             yield context
         finally:
-            # Clean up context
-            if tenant.tenant_id in self._contexts:
-                del self._contexts[tenant.tenant_id]
+            # Restore the previous snapshot so nested/overlapping scopes for
+            # the same tenant keep working.
+            self._contexts.reset(token)
 
     def get_current_context(self, tenant_id: str) -> Optional[TenantContext]:
         """Get current tenant context for a specific tenant.
@@ -140,7 +153,7 @@ class TenantContextManager:
         Returns:
             TenantContext if available, None otherwise
         """
-        return self._contexts.get(tenant_id)
+        return self._snapshot().get(tenant_id)
 
     def set_current_context(self, context: TenantContext) -> None:
         """Set current tenant context.
@@ -148,7 +161,9 @@ class TenantContextManager:
         Args:
             context: Tenant context to set as current
         """
-        self._contexts[context.tenant_id] = context
+        merged = dict(self._snapshot())
+        merged[context.tenant_id] = context
+        self._contexts.set(merged)
 
     def clear_context(self, tenant_id: str) -> None:
         """Clear tenant context.
@@ -156,12 +171,13 @@ class TenantContextManager:
         Args:
             tenant_id: ID of the tenant to clear context for
         """
-        if tenant_id in self._contexts:
-            del self._contexts[tenant_id]
+        merged = dict(self._snapshot())
+        merged.pop(tenant_id, None)
+        self._contexts.set(merged)
 
     def clear_all_contexts(self) -> None:
         """Clear all tenant contexts."""
-        self._contexts.clear()
+        self._contexts.set({})
 
     def get_active_tenants(self) -> List[str]:
         """Get list of tenant IDs with active contexts.
@@ -169,7 +185,7 @@ class TenantContextManager:
         Returns:
             List of tenant IDs that currently have active contexts
         """
-        return list(self._contexts.keys())
+        return list(self._snapshot().keys())
 
 
 # Global context manager instance

@@ -46,6 +46,12 @@ from trpc_agent_sdk.tenants._tenant_rollout import ConfigRolloutManager
 from trpc_agent_sdk.tenants._tenant_store import TenantStore
 from trpc_agent_sdk.tenants._tenant_telemetry import get_tenant_metrics
 
+# Placeholder returned instead of secret values in API responses. When a
+# client PUTs a config back containing this placeholder, the stored secret
+# is preserved unchanged.
+SECRET_MASK = "***REDACTED***"
+_SECRET_FIELDS = ("api_key", "webhook_secret", "webhook_token")
+
 
 class TenantAdminService:
     """Framework-agnostic tenant administration operations."""
@@ -89,9 +95,15 @@ class TenantAdminService:
             raise KeyError(f"Tenant '{tenant_id}' does not exist")
         payload = dict(payload)
         payload["tenant_id"] = tenant_id
-        updated = TenantConfig(**payload).to_tenant()
+        # Partial-update support: sections the client omitted keep their
+        # stored values instead of being reset by TenantConfig defaults.
+        merged = TenantConfig.from_tenant(existing).model_dump()
+        merged.update(payload)
+        updated = TenantConfig(**merged).to_tenant()
         # Preserve server-owned fields TenantConfig does not carry.
         updated.created_at = existing.created_at
+        # Keep stored secrets when the client echoed back SECRET_MASK values.
+        self._restore_masked_secrets(updated, existing)
         result = await self._store.update_tenant(updated)
         logger.info(f"Admin API: updated tenant {tenant_id}")
         return self._dump(result)
@@ -183,7 +195,58 @@ class TenantAdminService:
 
     @staticmethod
     def _dump(tenant: Tenant) -> Dict[str, Any]:
-        return TenantConfig.from_tenant(tenant).model_dump()
+        # Never echo secrets (model API key, IM tokens/secrets) back over the
+        # wire; replace them with SECRET_MASK placeholders.
+        return TenantAdminService._mask_secrets(TenantConfig.from_tenant(tenant).model_dump())
+
+    @staticmethod
+    def _mask_secrets(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace secret-valued fields with SECRET_MASK.
+
+        Masking is limited to the ``llm_config`` and ``channel_configs``
+        sections — exactly the sections :meth:`_restore_masked_secrets`
+        restores — so a field that merely shares a secret field's name in
+        some other section (e.g. ``custom_attributes``) is never corrupted
+        by an echo-back of the masked dump.
+        """
+        masked = dict(data)
+        if isinstance(masked.get("llm_config"), dict):
+            masked["llm_config"] = TenantAdminService._mask_secret_fields(masked["llm_config"])
+        if isinstance(masked.get("channel_configs"), dict):
+            masked["channel_configs"] = {
+                name: TenantAdminService._mask_secret_fields(config) if isinstance(config, dict) else config
+                for name, config in masked["channel_configs"].items()
+            }
+        return masked
+
+    @staticmethod
+    def _mask_secret_fields(section: Dict[str, Any]) -> Dict[str, Any]:
+        """Mask the known secret fields of one flat config section."""
+
+        def _mask(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {
+                    key: (SECRET_MASK if key in _SECRET_FIELDS and isinstance(value, str) and value else _mask(value))
+                    for key, value in obj.items()
+                }
+            if isinstance(obj, list):
+                return [_mask(item) for item in obj]
+            return obj
+
+        return _mask(section)
+
+    @staticmethod
+    def _restore_masked_secrets(updated: Tenant, existing: Tenant) -> None:
+        """Keep stored secrets when an update carries SECRET_MASK placeholders."""
+        if updated.model_config.api_key == SECRET_MASK:
+            updated.model_config.api_key = existing.model_config.api_key
+        for channel_type, channel_config in updated.channel_configs.items():
+            existing_config = existing.get_channel_config(channel_type)
+            if existing_config is None:
+                continue
+            for field in _SECRET_FIELDS:
+                if getattr(channel_config, field, None) == SECRET_MASK:
+                    setattr(channel_config, field, getattr(existing_config, field, None))
 
     @staticmethod
     def _dump_rollout(state) -> Dict[str, Any]:

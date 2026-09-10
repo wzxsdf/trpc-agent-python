@@ -40,6 +40,7 @@ from ._audit import (
     TenantAuditLogger,
     mask_secrets,
 )
+from ._im_transport import RedisFallbackMixin
 from ._tenant_context import TenantContext
 from ._tenant_telemetry import get_tenant_metrics
 
@@ -73,13 +74,14 @@ class ToolDecision:
     """Audit decision value (see ``_audit`` constants)."""
 
 
-class TenantUsageTracker:
+class TenantUsageTracker(RedisFallbackMixin):
     """Per-tenant monthly usage tracker with budget enforcement.
 
     Uses Redis hash counters keyed by ``tenant_usage:{tenant_id}:{YYYYMM}``
     so all nodes share one view of the budget. When Redis is unavailable the
     tracker degrades to per-process in-memory counters (same pattern as
-    :class:`~trpc_agent_sdk.tenants.MessageDeduplicator`).
+    :class:`~trpc_agent_sdk.tenants.MessageDeduplicator`) and periodically
+    retries the shared backend.
 
     Cost is accumulated in micro-USD integers to avoid float drift.
     """
@@ -100,7 +102,7 @@ class TenantUsageTracker:
 
         self._redis_url = redis_url
         self._redis = None
-        self._redis_failed = False
+        self._init_fallback_state()
         # In-memory fallback: {month_key: {"requests": int, "cost_micros": int, ...}}
         self._local_usage: Dict[str, Dict[str, int]] = {}
 
@@ -178,7 +180,7 @@ class TenantUsageTracker:
                 "type": "output"
             }, output_tokens)
 
-        if not self._redis_failed:
+        if not self._redis_down():
             try:
                 redis_client = await self._get_redis()
                 pipe = redis_client.pipeline()
@@ -191,7 +193,7 @@ class TenantUsageTracker:
             except Exception as e:
                 logger.warning(f"Redis usage tracking unavailable, "
                                f"falling back to in-memory: {e}")
-                self._redis_failed = True
+                self._mark_redis_failed()
 
         local = self._local_usage.setdefault(key, {})
         for field, value in increments.items():
@@ -203,7 +205,7 @@ class TenantUsageTracker:
         key = self._month_key(tenant_context.tenant_id)
         raw: Dict[str, int] = {}
 
-        if not self._redis_failed:
+        if not self._redis_down():
             try:
                 redis_client = await self._get_redis()
                 data = await redis_client.hgetall(key)
@@ -211,7 +213,7 @@ class TenantUsageTracker:
             except Exception as e:
                 logger.warning(f"Redis usage read unavailable, "
                                f"falling back to in-memory: {e}")
-                self._redis_failed = True
+                self._mark_redis_failed()
 
         if not raw:
             raw = self._local_usage.get(key, {})
