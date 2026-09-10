@@ -82,6 +82,12 @@ from ._im_transport import (
     WeComSender,
     send_with_retry,
 )
+from ._wecom_crypto import (
+    WeComCrypto,
+    WeComCryptoError,
+    WeComSignatureError,
+    WeComDecryptError,
+)
 from ._audit import (
     AuditLog,
     TenantAuditLogger,
@@ -219,6 +225,10 @@ __all__ = [
     "TenantResponse",
     "WeComTenantAdapter",
     "TelegramTenantAdapter",
+    "WeComCrypto",
+    "WeComCryptoError",
+    "WeComSignatureError",
+    "WeComDecryptError",
     "MessageDeduplicator",
     "TenantChannelManager",
 

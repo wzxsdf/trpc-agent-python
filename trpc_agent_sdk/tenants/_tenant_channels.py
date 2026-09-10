@@ -15,6 +15,8 @@ from typing import AsyncIterator, Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import hmac
+import time
 
 from trpc_agent_sdk.configs import RunConfig
 from trpc_agent_sdk.events import Event
@@ -29,8 +31,12 @@ from ._audit import (
     DECISION_IM_REPLIED,
     TenantAuditLogger,
 )
-from ._im_transport import (MessageChunker, RateLimiter, TelegramSender, WeComSender, send_with_retry)
+from ._tenant_context import TenantContext
+from ._tenant_governance import check_im_user_allowed
+from ._im_transport import (MessageChunker, RateLimiter, RedisFallbackMixin, TelegramSender, WeComSender,
+                            send_with_retry)
 from ._tenant_model import Tenant
+from ._wecom_crypto import WeComCrypto, WeComCryptoError, parse_callback_xml
 from ._tenant_store import TenantStore
 from ._tenant_telemetry import TRACER, extract_trace_headers, get_tenant_metrics
 
@@ -63,6 +69,21 @@ class TenantResponse:
     message_type: str = "text"  # 'text', 'card', 'image', 'file', etc.
     metadata: Dict[str, Any] = None
     reply_to_message_id: Optional[str] = None
+
+
+def _get_header(headers: Dict[str, Any], name: str) -> Optional[str]:
+    """Look up an HTTP header case-insensitively.
+
+    Webhook callers may pass raw WSGI/ASGI headers with arbitrary casing;
+    the previous exact-match ``headers.get(...)`` silently missed them.
+    """
+    if not headers:
+        return None
+    lowered = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == lowered:
+            return value
+    return None
 
 
 class TenantChannelAdapter(ABC):
@@ -158,7 +179,7 @@ class WeComTenantAdapter(TenantChannelAdapter):
 
         try:
             # Extract token for tenant identification
-            token = payload.get("token") or headers.get("X-WeCom-Token")
+            token = payload.get("token") or _get_header(headers, "X-WeCom-Token")
 
             if not token:
                 logger.warning("Missing WeCom token for tenant identification")
@@ -207,7 +228,7 @@ class WeComTenantAdapter(TenantChannelAdapter):
             sender = WeComSender(
                 corp_id=wecom_config.bot_id,
                 corp_secret=wecom_config.api_key,
-                agent_id=wecom_config.webhook_token or "1",
+                agent_id=wecom_config.agent_id or wecom_config.webhook_token or "1",
                 http_client=self._http_client,
             )
             if response.message_type == "card":
@@ -262,7 +283,8 @@ class WeComTenantAdapter(TenantChannelAdapter):
             # Calculate SHA1 signature
             calculated_signature = hashlib.sha1(sign_str.encode()).hexdigest()
 
-            return signature == calculated_signature
+            # Constant-time comparison to prevent timing attacks
+            return hmac.compare_digest(str(signature), calculated_signature)
 
         except Exception as e:
             logger.error(f"WeCom signature verification error: {e}")
@@ -303,6 +325,187 @@ class WeComTenantAdapter(TenantChannelAdapter):
             original_payload=payload,
         )
 
+    # ---- Real WeCom self-built-app callback protocol ----------------------
+    # The admin console's "接收消息" feature: GET echostr URL verification and
+    # POST encrypted-XML message callbacks (see _wecom_crypto for the wire
+    # format). Routed by plaintext ToUserName (corp_id -> ChannelConfig.bot_id).
+
+    async def handle_wecom_callback(self, xml_body: str, query: Dict[str, str]) -> Optional[TenantMessage]:
+        """Handle a real WeCom self-built-app message callback (encrypted XML).
+
+        The outer ``<ToUserName>`` (plaintext corp_id) locates candidate
+        tenants via ``ChannelConfig.bot_id``; each candidate's Token /
+        EncodingAESKey then verifies ``msg_signature`` and decrypts the
+        payload. The decrypted embedded receiveid is checked against the
+        corp_id (tamper protection), and same-corp multi-app setups are
+        disambiguated by ``AgentID`` when ``ChannelConfig.agent_id`` is set.
+
+        Args:
+            xml_body: Raw POST body ``<xml><ToUserName/><Encrypt/></xml>``.
+            query: Callback query params with ``msg_signature``/``timestamp``/``nonce``.
+
+        Returns:
+            TenantMessage, or None when routing or verification failed.
+        """
+        msg_signature = query.get("msg_signature")
+        timestamp = query.get("timestamp")
+        nonce = query.get("nonce")
+        if not all([msg_signature, timestamp, nonce]):
+            logger.warning("WeCom callback missing msg_signature/timestamp/nonce")
+            return None
+
+        try:
+            to_user_name, encrypt = parse_callback_xml(xml_body)
+        except WeComCryptoError as e:
+            logger.warning(f"Invalid WeCom callback body: {e}")
+            return None
+
+        for tenant in await self._find_tenants_by_corp_id(to_user_name):
+            wecom_config = tenant.get_channel_config("wecom")
+            try:
+                crypto = WeComCrypto(
+                    token=wecom_config.webhook_token or "",
+                    encoding_aes_key=wecom_config.webhook_secret or "",
+                    receive_id=to_user_name,
+                )
+            except (ImportError, WeComCryptoError) as e:
+                # webhook_secret is the EncodingAESKey under the real
+                # protocol; a bad value must fail loudly here.
+                logger.error(f"WeCom crypto unavailable for tenant {tenant.tenant_id}: {e}")
+                return None
+
+            if not crypto.verify_signature(msg_signature, timestamp, nonce, encrypt):
+                continue
+            try:
+                xml_msg = crypto.decrypt(encrypt)
+            except WeComCryptoError as e:
+                logger.warning(f"WeCom callback decryption failed for tenant {tenant.tenant_id}: {e}")
+                continue
+
+            fields = self._parse_callback_message_xml(xml_msg)
+            configured_agent_id = wecom_config.agent_id
+            if configured_agent_id and fields.get("AgentID") and str(fields["AgentID"]) != str(configured_agent_id):
+                continue  # another app of the same corp
+            return self._callback_message_from_fields(fields, tenant)
+
+        logger.warning(f"No tenant verified the WeCom callback for corp '{to_user_name}'")
+        return None
+
+    async def verify_wecom_url(self, query: Dict[str, str]) -> Optional[str]:
+        """Handle the GET callback-URL verification (echostr) request.
+
+        The query carries no corp_id, so tenants with a WeCom channel are
+        probed in order; the first one whose Token/EncodingAESKey verifies
+        the signature wins.
+
+        Args:
+            query: Callback query params with ``msg_signature``/``timestamp``/
+                ``nonce``/``echostr``.
+
+        Returns:
+            The decrypted echo plain text to return verbatim in the HTTP
+            response, or None when verification failed.
+        """
+        msg_signature = query.get("msg_signature")
+        timestamp = query.get("timestamp")
+        nonce = query.get("nonce")
+        echostr = query.get("echostr")
+        if not all([msg_signature, timestamp, nonce, echostr]):
+            logger.warning("WeCom URL verification missing query parameters")
+            return None
+
+        tenants = await self._tenant_store.list_tenants(active_only=True)
+        for tenant in tenants:
+            wecom_config = tenant.get_channel_config("wecom")
+            if not wecom_config or not (wecom_config.webhook_token and wecom_config.webhook_secret):
+                continue
+            try:
+                crypto = WeComCrypto(wecom_config.webhook_token, wecom_config.webhook_secret)
+            except (ImportError, WeComCryptoError) as e:
+                logger.error(f"WeCom crypto unavailable for tenant {tenant.tenant_id}: {e}")
+                return None
+            try:
+                return crypto.verify_url(msg_signature, timestamp, nonce, echostr)
+            except WeComCryptoError:
+                continue
+
+        logger.warning("No tenant verified the WeCom URL verification request")
+        return None
+
+    async def _find_tenants_by_corp_id(self, corp_id: str) -> List[Tenant]:
+        """Return active tenants whose WeCom ``bot_id`` equals ``corp_id``."""
+        result: List[Tenant] = []
+        for tenant in await self._tenant_store.list_tenants(active_only=True):
+            wecom_config = tenant.get_channel_config("wecom")
+            if wecom_config and wecom_config.bot_id == corp_id:
+                result.append(tenant)
+        return result
+
+    @staticmethod
+    def _parse_callback_message_xml(xml_msg: str) -> Dict[str, str]:
+        """Flatten a decrypted callback message XML into a str dict."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml_msg)
+        except ET.ParseError as e:
+            logger.warning(f"Decrypted WeCom message is not valid XML: {e}")
+            return {}
+        return {child.tag: (child.text or "").strip() for child in root}
+
+    def _callback_message_from_fields(self, fields: Dict[str, str], tenant: Tenant) -> TenantMessage:
+        """Build a TenantMessage from a decrypted WeCom callback message.
+
+        Real-protocol group semantics: app-chat messages carry a ``ChatId``
+        (unlike the simulated protocol's ``$``-prefix convention); private
+        messages fall back to the sender's userid as the chat id.
+        """
+        msg_type = fields.get("MsgType", "text")
+        from_user = fields.get("FromUserName", "")
+        chat_id = fields.get("ChatId", "")
+        is_group_chat = bool(chat_id)
+
+        if msg_type == "text":
+            content = fields.get("Content", "")
+        elif msg_type == "event":
+            content = f"[event:{fields.get('Event', 'unknown')}]"
+        else:
+            content = f"[{msg_type} message]"
+
+        message_id = fields.get("MsgId", "")
+        if not message_id:
+            # Event callbacks carry no MsgId; derive one from the create time.
+            message_id = f"wecom_evt_{fields.get('CreateTime') or int(datetime.utcnow().timestamp())}"
+
+        create_time = fields.get("CreateTime", "")
+        if create_time.isdigit():
+            timestamp = datetime.utcfromtimestamp(int(create_time))
+        else:
+            timestamp = datetime.utcnow()
+
+        metadata: Dict[str, Any] = {
+            "msg_type": msg_type,
+            "to_user_name": fields.get("ToUserName", ""),
+            "agent_id": fields.get("AgentID", ""),
+            "session_strategy": _resolve_session_strategy(tenant, "wecom"),
+        }
+        if msg_type == "event":
+            metadata["event"] = fields.get("Event", "")
+            metadata["event_key"] = fields.get("EventKey", "")
+
+        return TenantMessage(
+            tenant_id=tenant.tenant_id,
+            channel_type="wecom",
+            user_id=from_user,
+            chat_id=chat_id or from_user,
+            message_id=message_id,
+            content=content,
+            metadata=metadata,
+            timestamp=timestamp,
+            is_group_chat=is_group_chat,
+            original_payload=fields,
+        )
+
 
 class TelegramTenantAdapter(TenantChannelAdapter):
     """Telegram tenant-aware adapter.
@@ -319,7 +522,7 @@ class TelegramTenantAdapter(TenantChannelAdapter):
         try:
             # Telegram bot token is typically in the webhook URL
             # Extract from headers or path
-            bot_token = headers.get("X-Telegram-Bot-Token")
+            bot_token = _get_header(headers, "X-Telegram-Bot-Token")
 
             if not bot_token:
                 logger.warning("Missing Telegram bot token for tenant identification")
@@ -330,6 +533,25 @@ class TelegramTenantAdapter(TenantChannelAdapter):
             if not tenant:
                 logger.warning("No tenant found for Telegram bot token")
                 return None
+
+            # Verify the webhook secret token. Telegram sends the value
+            # configured via ``setWebhook(secret_token=...)`` in the
+            # ``X-Telegram-Bot-Api-Secret-Token`` header. Verification is
+            # enforced when the tenant has a ``webhook_secret`` configured;
+            # without it the bot token itself is the only credential, which
+            # is transmitted in plaintext and must not be trusted alone.
+            telegram_config = tenant.get_channel_config("telegram")
+            secret = telegram_config.webhook_secret if telegram_config else None
+            if secret:
+                provided = _get_header(headers, "X-Telegram-Bot-Api-Secret-Token")
+                if not provided or not hmac.compare_digest(provided, secret):
+                    logger.warning("Telegram webhook secret token verification failed "
+                                   f"for tenant {tenant.tenant_id}")
+                    return None
+            else:
+                logger.warning(
+                    "Tenant %s has no Telegram webhook_secret configured; "
+                    "skipping secret-token verification", tenant.tenant_id)
 
             # Extract message information
             message = self._extract_telegram_message(payload, tenant)
@@ -440,7 +662,7 @@ class TelegramTenantAdapter(TenantChannelAdapter):
         )
 
 
-class MessageDeduplicator:
+class MessageDeduplicator(RedisFallbackMixin):
     """Message deduplication for multi-tenant IM processing.
 
     Prevents duplicate processing of the same message across multiple
@@ -461,10 +683,10 @@ class MessageDeduplicator:
 
         self._redis_url = redis_url
         self._redis: Optional[redis.Redis] = None
-        # ponytail: in-memory fallback when Redis is unavailable — per-process only,
+        self._init_fallback_state()
+        # In-memory fallback when Redis is unavailable — per-process only,
         # switch to a real Redis if cross-node dedup matters
         self._local_seen: dict[str, float] = {}
-        self._redis_failed = False
 
     async def _get_redis(self):
         """Lazy initialization of Redis connection."""
@@ -486,7 +708,7 @@ class MessageDeduplicator:
         dedup_key = self._generate_dedup_key(message)
 
         # Fall back to in-memory dedup if Redis is unreachable or incompatible
-        if not self._redis_failed:
+        if not self._redis_down():
             try:
                 redis_client = await self._get_redis()
 
@@ -497,7 +719,7 @@ class MessageDeduplicator:
                 is_dup = exists is not True
             except Exception as e:
                 logger.warning(f"Redis dedup unavailable, falling back to in-memory: {e}")
-                self._redis_failed = True
+                self._mark_redis_failed()
                 is_dup = self._local_is_duplicate(dedup_key)
         else:
             is_dup = self._local_is_duplicate(dedup_key)
@@ -511,8 +733,6 @@ class MessageDeduplicator:
 
     def _local_is_duplicate(self, dedup_key: str) -> bool:
         """In-memory deduplication fallback with 1-hour TTL."""
-        import time
-
         now = time.time()
         # Purge expired entries
         self._local_seen = {k: t for k, t in self._local_seen.items() if now - t < 3600}
@@ -615,11 +835,66 @@ class TenantChannelManager:
             logger.warning(f"Unsupported channel type: {channel_type}")
             return None
 
+        message = await adapter.handle_webhook(channel_type, payload, headers)
+        return await self._accept_message(channel_type, message, headers)
+
+    async def handle_wecom_callback(self, xml_body: str, query: Dict[str, str]) -> Optional[TenantMessage]:
+        """Handle a real WeCom (企业微信) self-built-app message callback.
+
+        Decrypts and routes the callback via the WeCom adapter, then runs
+        the full inbound pipeline (whitelist / dedup / audit). HTTP callers
+        should answer ``"success"`` immediately and process the returned
+        message in the background (WeCom enforces a 5-second response
+        deadline).
+
+        Args:
+            xml_body: Raw POST body ``<xml><ToUserName/><Encrypt/></xml>``.
+            query: Callback query params with ``msg_signature``/``timestamp``/``nonce``.
+
+        Returns:
+            TenantMessage if accepted, None otherwise.
+        """
+        adapter = self._adapters.get("wecom")
+        if not isinstance(adapter, WeComTenantAdapter):
+            logger.warning("WeCom callback received but the wecom adapter is not a WeComTenantAdapter")
+            return None
+        message = await adapter.handle_wecom_callback(xml_body, query)
+        return await self._accept_message("wecom", message, {})
+
+    async def verify_wecom_url(self, query: Dict[str, str]) -> Optional[str]:
+        """Verify the WeCom callback URL (GET echostr challenge).
+
+        Args:
+            query: Query params with ``msg_signature``/``timestamp``/``nonce``/
+                ``echostr``.
+
+        Returns:
+            The decrypted echo plain text to return verbatim, or None when
+            verification failed.
+        """
+        adapter = self._adapters.get("wecom")
+        if not isinstance(adapter, WeComTenantAdapter):
+            logger.warning("WeCom URL verification received but the wecom adapter is not a WeComTenantAdapter")
+            return None
+        return await adapter.verify_wecom_url(query)
+
+    async def _accept_message(self, channel_type: str, message: Optional[TenantMessage],
+                              headers: Dict[str, Any]) -> Optional[TenantMessage]:
+        """Run the shared inbound pipeline (span / whitelist / dedup / audit).
+
+        Args:
+            channel_type: IM channel the message arrived on.
+            message: Message produced by the channel adapter (None when the
+                adapter rejected it).
+            headers: HTTP headers of the inbound request.
+
+        Returns:
+            The accepted message, or None when any stage rejected it.
+        """
         # Root span for the inbound IM request; continues an upstream trace
         # when the platform/gateway forwarded a W3C traceparent header.
         with extract_trace_headers(headers), TRACER.start_as_current_span("tenant.im.callback") as span:
             span.set_attribute("tenant.channel", channel_type)
-            message = await adapter.handle_webhook(channel_type, payload, headers)
             if not message:
                 span.set_attribute("tenant.accepted", False)
                 await self._audit(f"unknown:{channel_type}", DECISION_IM_REJECTED, None,
@@ -629,6 +904,20 @@ class TenantChannelManager:
             span.set_attribute("tenant.id", message.tenant_id)
             span.set_attribute("tenant.accepted", True)
             span.set_attribute("tenant.message_id", message.message_id)
+
+            # Enforce the tenant's IM user whitelist (ChannelConfig.allowed_users).
+            tenant = await self._tenant_store.get_tenant(message.tenant_id)
+            if tenant is None:
+                logger.warning(f"Tenant {message.tenant_id} vanished before user check")
+                span.set_attribute("tenant.accepted", False)
+                await self._audit(message.tenant_id, DECISION_IM_REJECTED, message, {"reason": "tenant not found"})
+                return None
+            if not check_im_user_allowed(TenantContext(tenant), message.channel_type, message.user_id):
+                logger.warning(f"IM user {message.user_id} not allowed for tenant {message.tenant_id}")
+                span.set_attribute("tenant.accepted", False)
+                await self._audit(message.tenant_id, DECISION_IM_REJECTED, message,
+                                  {"reason": "user not in allowed_users"})
+                return None
 
             # Check for duplicate messages
             is_duplicate = await self._deduplicator.is_duplicate(message)

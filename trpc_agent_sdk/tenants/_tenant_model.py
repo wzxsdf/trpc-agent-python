@@ -63,6 +63,10 @@ class ChannelConfig:
     webhook_secret: Optional[str] = None
     api_key: Optional[str] = None
     bot_id: Optional[str] = None
+    # WeCom self-built app agent id. The real callback protocol carries the
+    # AgentID inside the encrypted payload, and outgoing message/send needs
+    # it; falls back to webhook_token for legacy simulated-protocol configs.
+    agent_id: Optional[str] = None
     allowed_users: List[str] = field(default_factory=list)
     rate_limit_per_minute: int = 60
     enable_streaming: bool = True

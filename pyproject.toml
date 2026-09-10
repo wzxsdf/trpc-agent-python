@@ -69,6 +69,9 @@ openclaw = [
      "aiofiles",
      "wecom-aibot-sdk-python>=0.1.5",
 ]
+wecom = [
+    "cryptography>=42.0.0",
+]
 graph = [
     "langgraph>=0.6.0",
     "langchain-core>=0.3.27",
@@ -140,6 +143,7 @@ all = [
     "protobuf>=5.29.5",
     "numpy>=2.2.5",
     "fastapi>=0.95.0",
+    "cryptography>=42.0.0",
     "langgraph>=0.6.0",
     "langchain-core>=0.3.27",
     "langchain>=0.3.27",
